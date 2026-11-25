@@ -1,0 +1,13 @@
+# 文件能力组（测试用）。
+#
+# id 刻意与内置 `file` 组同名：验证"同一个能力组由内置实现（file.read/file.write）
+# 和插件共同提供"能否正确合并进同一份注册表，而不是让插件另开一个组来回避。
+[group]
+id = "file"
+name = "文件"
+version = "0.1.0"
+kind = "tools"
+priority = 10
+default_enabled = true
+default_risk = "low"
+tags = ["builtin", "file"]

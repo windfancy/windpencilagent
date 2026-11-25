@@ -1,0 +1,12 @@
+[plugin]
+id = "file.demo"
+name = "演示工具"
+version = "0.1.0"
+group = "file"
+risk = "low"
+permissions = []
+binary = "file_demo.dll"
+summary = "向导生成的可运行示例（验证 P0-8）"
+default_enabled = true
+tags = ["file"]
+capabilities = []

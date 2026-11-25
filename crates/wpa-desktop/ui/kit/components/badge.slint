@@ -1,0 +1,44 @@
+import { Theme } from "../tokens.slint";
+
+export enum BadgeStatus {
+    success,
+    warning,
+    critical,
+    neutral
+}
+
+export component Badge {
+    in property <string> text;
+    in property <BadgeStatus> status: BadgeStatus.neutral;
+
+    // 必须显式给高度：根元素不是布局，只写 min-height 时放进 HorizontalLayout
+    // 会退化成"最小宽度"，文字被压成竖排（模型页实测）。
+    height: 22px;
+    min-width: 48px;
+
+    bg := Rectangle {
+        width: parent.width;
+        height: parent.height;
+        border-radius: 11px;
+        background: status == BadgeStatus.success ? Theme.palette.success :
+                    status == BadgeStatus.warning ? Theme.palette.warning :
+                    status == BadgeStatus.critical ? Theme.palette.critical :
+                    Theme.palette.surface_raised;
+
+        HorizontalLayout {
+            padding-left: Theme.spacing.sm;
+            padding-right: Theme.spacing.sm;
+            alignment: center;
+            
+            txt := Text {
+                text: root.text;
+                color: status == BadgeStatus.neutral ? Theme.palette.text_primary : Theme.palette.on_status;
+                font-family: Theme.typography.font_family;
+                font-size: Theme.typography.caption_size;
+                font-weight: Theme.typography.caption_weight;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+    }
+}

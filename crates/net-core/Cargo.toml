@@ -1,0 +1,20 @@
+[package]
+name = "net-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "基座网络原语：TCP 探测 / banner / DNS 报文 / HTTP（自研，不依赖外部程序）"
+
+[dependencies]
+kern-core = { path = "../kern-core" }
+toolkit-core = { path = "../toolkit-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

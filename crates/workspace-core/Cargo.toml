@@ -1,0 +1,17 @@
+[package]
+name = "workspace-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "工作空间（多空间隔离：目录/权限/授权范围/模型/树包/记忆）"
+
+[dependencies]
+kern-core = { path = "../kern-core" }
+toolkit-core = { path = "../toolkit-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+toml = "0.8"

@@ -1,0 +1,15 @@
+[package]
+name = "browser-core"
+version.workspace = true
+edition.workspace = true
+description = "无头 HTTP 浏览器：会话池 + Cookie 池 + 批量限流 + HTML 解析（无 JS 引擎）"
+
+[dependencies]
+wpa-kit = { path = "../wpa-kit" }
+# 只为读全局网络参数（超时 / QPS / UA）：抓取预算必须和 net.* 用同一份配置，
+# 否则用户在界面上改的超时只对 net.http 生效、对浏览器不生效。
+net-core = { path = "../net-core" }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+futures-util = { workspace = true }

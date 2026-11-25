@@ -1,0 +1,39 @@
+[package]
+name = "wpa-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "基座装配引擎：配置 / 契约宿主 / 工具装配 / 会话构建 / UI 快照"
+
+[dependencies]
+wpa-api = { path = "../wpa-api" }
+kern-core = { path = "../kern-core" }
+base-llm = { path = "../base-llm" }
+base-store = { path = "../base-store" }
+toolkit-core = { path = "../toolkit-core" }
+shell-core = { path = "../shell-core" }
+workspace-core = { path = "../workspace-core" }
+agent-core = { path = "../agent-core" }
+net-core = { path = "../net-core" }
+text-core = { path = "../text-core" }
+knowledge-core = { path = "../knowledge-core" }
+tree-core = { path = "../tree-core" }
+plugin-host = { path = "../plugin-host" }
+plugin-abi = { path = "../plugin-abi" }
+browser-core = { path = "../browser-core" }
+wpa-kit = { path = "../wpa-kit" }
+futures-util = { workspace = true }
+# TLS 证书解析：native-tls 已被 reqwest 间接引入，复用它比再塞一套 rustls 省
+native-tls = "0.2"
+tokio-native-tls = "0.3"
+x509-parser = "0.16"
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+toml = "0.8"
+tracing = { workspace = true }

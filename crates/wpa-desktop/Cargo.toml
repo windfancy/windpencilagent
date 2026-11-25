@@ -1,0 +1,41 @@
+[package]
+name = "wpa-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "windpencilagent 基座桌面端（Slint）：对话 / 内置能力 / 领域 / 空间 / 模型 / 工具（Slint）：对话 / 任务 / 智能树 / 空间 / 记忆 / 模型 / 设置"
+
+[lib]
+name = "wpa_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "windpencilagent"
+path = "src/main.rs"
+
+[build-dependencies]
+slint-build = "=1.13.1"
+
+[dependencies]
+# Slint 默认 features 会拉三样本项目用不到的东西（2026-11-26 实测后收窄）：
+#   backend-default → i-slint-backend-qt   Windows 上编出空壳（.text = 0 字节），只是脏依赖树
+#   renderer-software                     本机只走 femtovg/OpenGL，软件渲染路径不会被选中
+#   accessibility → accesskit_windows     本项目未接无障碍，accesskit 的 .text 白占
+# 只留：std + winit 后端 + femtovg 渲染器 + 1.2 兼容层
+slint = { version = "=1.13.1", default-features = false, features = [
+    "std",
+    "backend-winit",
+    "renderer-femtovg",
+    "compat-1-2",
+] }
+wpa-engine = { path = "../wpa-engine" }
+kern-core = { path = "../kern-core" }
+base-llm = { path = "../base-llm" }
+agent-core = { path = "../agent-core" }
+workspace-core = { path = "../workspace-core" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

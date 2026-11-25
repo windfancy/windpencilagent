@@ -1,0 +1,10 @@
+[package]
+name = "plugin-abi"
+version.workspace = true
+edition.workspace = true
+description = "WindBot 插件 C ABI：插件与宿主共用的唯一真相源（零依赖）"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

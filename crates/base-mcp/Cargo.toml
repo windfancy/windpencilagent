@@ -1,0 +1,17 @@
+[package]
+name = "base-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "MCP stdio 客户端：自研 JSON-RPC over stdio，外部 MCP server 工具映射与崩溃隔离"
+
+[dependencies]
+kern-core = { path = "../kern-core" }
+toolkit-core = { path = "../toolkit-core" }
+tokio = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

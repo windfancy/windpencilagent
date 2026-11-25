@@ -1,0 +1,26 @@
+[package]
+name = "wpa-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "windpencilagent 基座 CLI：无树启动即通用对话智能体"
+
+[[bin]]
+name = "windpencilagent-cli"
+path = "src/main.rs"
+
+[dependencies]
+wpa-api = { path = "../wpa-api" }
+wpa-engine = { path = "../wpa-engine" }
+kern-core = { path = "../kern-core" }
+toolkit-core = { path = "../toolkit-core" }
+agent-core = { path = "../agent-core" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

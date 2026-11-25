@@ -1,0 +1,13 @@
+[package]
+name = "file_path_info"
+version.workspace = true
+edition.workspace = true
+description = "file 组测试插件：路径解析（验证插件机制全链路）"
+
+[lib]
+name = "file_path_info"
+crate-type = ["cdylib"]
+
+[dependencies]
+plugin-sdk = { workspace = true }
+serde_json = { workspace = true }

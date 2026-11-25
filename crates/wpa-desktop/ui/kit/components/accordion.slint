@@ -1,0 +1,74 @@
+import { Theme } from "../tokens.slint";
+
+export component AccordionItem {
+    in property <string> title: "";
+    in-out property <bool> is-open: false;
+
+    callback toggled(bool);
+
+    width: 100%;
+
+    VerticalLayout {
+        spacing: 0;
+
+        // Header
+        header := Rectangle {
+            width: 100%;
+            height: 48px;
+            background: transparent;
+
+            HorizontalLayout {
+                padding-left: Theme.spacing.md;
+                padding-right: Theme.spacing.md;
+                alignment: space-between;
+
+                Text {
+                    text: root.title;
+                    font-family: Theme.typography.font_family;
+                    font-size: Theme.typography.body_size;
+                    font-weight: Theme.typography.header_weight;
+                    color: Theme.palette.text_primary;
+                    vertical-alignment: center;
+                }
+
+                // Chevron (simulate with text or simple drawing)
+                Text {
+                    text: root.is-open ? "▼" : "▶";
+                    font-size: Theme.typography.caption_size;
+                    color: Theme.palette.text_secondary;
+                    vertical-alignment: center;
+                }
+            }
+
+            TouchArea {
+                clicked => {
+                    root.is-open = !root.is-open;
+                    root.toggled(root.is-open);
+                }
+            }
+        }
+
+        // Content
+        content_area := Rectangle {
+            visible: root.is-open;
+            width: 100%;
+            clip: true;
+            
+            VerticalLayout {
+                padding-left: Theme.spacing.md;
+                padding-right: Theme.spacing.md;
+                padding-bottom: Theme.spacing.md;
+                padding-top: Theme.spacing.xs;
+                
+                @children
+            }
+        }
+        
+        // Separator
+        Rectangle {
+            width: 100%;
+            height: 1px;
+            background: Theme.palette.border;
+        }
+    }
+}

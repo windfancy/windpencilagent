@@ -1,0 +1,18 @@
+[package]
+name = "wpa-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "windpencilagent 基座与专业智能树之间的唯一接口契约（四类群组插件）"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = "0.8"
+
+[dev-dependencies]
+tokio = { workspace = true }

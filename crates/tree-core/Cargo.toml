@@ -1,0 +1,20 @@
+[package]
+name = "tree-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "树包（智能树数据包）：清单解析 / 声明式工具 / 插槽 / 安装器 / 约束钩子 / 阶段"
+
+[dependencies]
+wpa-api = { path = "../wpa-api" }
+knowledge-core = { path = "../knowledge-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+toml = "0.8"
+zip = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

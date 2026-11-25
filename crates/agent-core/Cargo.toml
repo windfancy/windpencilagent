@@ -1,0 +1,18 @@
+[package]
+name = "agent-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kern-core = { path = "../kern-core" }
+base-llm = { path = "../base-llm" }
+base-store = { path = "../base-store" }
+toolkit-core = { path = "../toolkit-core" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+tracing.workspace = true

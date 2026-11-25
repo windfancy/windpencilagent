@@ -1,0 +1,18 @@
+[package]
+name = "plugin-host"
+version.workspace = true
+edition.workspace = true
+description = "插件宿主：扫描/注册表/拓扑/加载/熔断/工具适配"
+
+[dependencies]
+wpa-api = { path = "../wpa-api" }
+plugin-abi = { path = "../plugin-abi" }
+tree-core = { path = "../tree-core" }
+libloading = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+tracing = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }

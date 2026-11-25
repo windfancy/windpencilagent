@@ -1,0 +1,268 @@
+# ============================================================================
+# 领域工具清单（GENERATED —— 不要手工编辑）
+# ============================================================================
+#
+# 生成命令：windpencilagent-cli registry export --domain default
+# 基座版本：0.1.0
+# 领域定义：domains/default/domain.toml
+#
+# 本文件不参与装配（装配读注册表），用途有三个：
+#   1. 审计：这个领域到底暴露了哪些工具，一望可知
+#   2. 演进：版本间 diff 即能力变更记录
+#   3. 预算：tool_count 与 schema 体积可估算 prompt 开销
+#
+# 为什么没有 kind/source 列：注册表只记「工具属于哪个组」，不记实现来源。
+# 硬写只能靠猜，本文件宁可少一列也不写不确切的字段。
+# ============================================================================
+
+[meta]
+domain = "default"
+domain_name = "通用对话"
+registry_version = 1
+group_count = 9
+tool_count = 33
+declared_but_empty = []
+
+[[group]]
+id = "core"
+label = "内核"
+tools = 2
+
+[[group]]
+id = "file"
+label = "文件"
+tools = 2
+
+[[group]]
+id = "shell"
+label = "命令与作业"
+tools = 3
+
+[[group]]
+id = "sandbox"
+label = "沙箱执行"
+tools = 3
+
+[[group]]
+id = "net"
+label = "网络"
+tools = 5
+
+[[group]]
+id = "text"
+label = "文本"
+tools = 5
+
+[[group]]
+id = "space"
+label = "工作空间"
+tools = 8
+
+[[group]]
+id = "memory"
+label = "记忆检索"
+tools = 1
+
+[[group]]
+id = "agent"
+label = "agent"
+tools = 4
+
+[[tool]]
+name = "kb.search"
+group = "core"
+risk = "none"
+summary = "在已装入的领域知识库中检索（精确 id / 标题 / 标签 / 正文分级匹配）。不知道答案时先查知识，不要凭空推断。"
+
+[[tool]]
+name = "util.echo"
+group = "core"
+risk = "none"
+summary = "原样返回输入文本，用于自检与链路验证。参数：text"
+
+[[tool]]
+name = "file.read"
+group = "file"
+risk = "low"
+summary = "读取文件（多编码自动识别，UTF-8/GBK/Big5）：落点白名单为 exe 同级 scripts/、data/ 下相对路径，禁 .. / 绝对路径 / 盘符。全文上限 256KB。用途：读回脚本输出、检查下载内容。低风险。"
+
+[[tool]]
+name = "file.write"
+group = "file"
+risk = "medium"
+summary = "写文件（把脚本写进 scripts/ 后用 sandbox.python 执行）：落点白名单为 exe 同级 scripts/、data/ 下相对路径，禁 .. / 绝对路径 / 盘符；自动创建父目录，覆盖写。参数：path(必填)、content(必填)、overwrite(可选,bool,默认 true)。返回写入字节数。中风险。"
+
+[[tool]]
+name = "shell.jobs"
+group = "shell"
+risk = "low"
+summary = "管理后台任务：action=list（全部任务概要：id/命令/状态/退出码）、action=output（job_id 必填，增量读取自上次读取后的新输出，done=true 表示已结束）、action=kill（job_id 必填，强制终止）。"
+
+[[tool]]
+name = "shell.run"
+group = "shell"
+risk = "medium"
+summary = "在持久 shell 会话中执行一条命令（cmd 或 powershell，cwd/环境变量跨命令保留）。参数：command(必填)、session(可选,默认 default)、shell(可选,cmd/powershell,首次创建用)、cwd(可选,切目录)、timeout_secs(可选,1-300 默认 60)、env(可选,对象,本条命令临时环境变量)、background(可选,true=转后台执行,立即返回 job_id,用 shell.jobs 读取输出/终止——长扫描/长安装建议后台)。风险按命令判定：业务白名单（基座默认空）内的程序免审；未知/破坏性命令需人工审批。"
+
+[[tool]]
+name = "shell.sessions"
+group = "shell"
+risk = "low"
+summary = "管理 shell 会话：列出全部（名称/类型/cwd/命令计数）、删除或重置指定会话。参数：list(可选,bool)、remove(可选,会话名)、reset(可选,对象{session,shell?,cwd?})"
+
+[[tool]]
+name = "os.exec"
+group = "sandbox"
+risk = "medium"
+summary = "在进程沙箱中执行命令行程序（argv 直传、不经 shell），限时并截断输出。参数：command(必填，程序名)、args(可选，字符串数组)、timeout_secs(可选，1-120 默认 30)。风险按参数判定：业务规则白名单内的程序免审；未知/破坏性命令需人工审批。"
+
+[[tool]]
+name = "sandbox.pip"
+group = "sandbox"
+risk = "medium"
+summary = "Python 依赖安装：python -m pip install --target <exe 同级 site-packages/>（先 ensurepip 幂等自举，失败仅记录）。sandbox.python 的 PYTHONPATH 已包含 site-packages/，安装完成即可 import。参数：packages(必填,字符串数组)、upgrade(可选,bool,默认 false)。中风险。"
+
+[[tool]]
+name = "sandbox.python"
+group = "sandbox"
+risk = "medium"
+summary = "Python 运行沙箱：在 exe 同级 scripts/ 目录内执行 .py 脚本（解释器来自随包 python/），argv 直传、限时、输出截断、审计留痕。script 与 code 二选一：script 为 scripts/ 下相对路径（禁 .. / 绝对路径）；code 为内联源码（自动落盘 scripts/_inline_<hash>.py 后执行）。依赖可先用 sandbox.pip 安装。风险按内容判定：脚本路径默认免审；内联代码命中破坏性/逃逸模式需人工审批。"
+
+[[tool]]
+name = "net.banner"
+group = "net"
+risk = "low"
+summary = "连接目标指定端口并读取欢迎信息（服务指纹的第一手证据）。"
+
+[[tool]]
+name = "net.dns"
+group = "net"
+risk = "low"
+summary = "解析域名的 A/AAAA/CNAME/MX/TXT/NS/SOA 记录。返回 TTL 与记录值，用于资产归属与基础设施判定。"
+
+[[tool]]
+name = "net.http"
+group = "net"
+risk = "low"
+summary = "发起 HTTP 请求并返回状态码、响应头与正文摘要。用于接口探测、指纹识别、健康检查。"
+
+[[tool]]
+name = "net.reach"
+group = "net"
+risk = "low"
+summary = "判断主机是否在线：对若干常见端口做 TCP 连接，任一成功即视为可达（不需要管理员权限，优于 ICMP）。"
+
+[[tool]]
+name = "net.scan"
+group = "net"
+risk = "medium"
+summary = "对目标做 TCP connect 端口探测（可选抓 banner）。ports 支持 `80,443`、`1-1024`、`22,8000-8100`。只探测、不改动目标。"
+
+[[tool]]
+name = "text.codec"
+group = "text"
+risk = "none"
+summary = "编解码文本：base64 / base64url / url / hex / html 实体。action = encode | decode。"
+
+[[tool]]
+name = "text.extract"
+group = "text"
+risk = "none"
+summary = "从文本中批量提取结构化线索：url / email / ip / domain / path / jwt（去重保序）。"
+
+[[tool]]
+name = "text.hash"
+group = "text"
+risk = "none"
+summary = "计算文本/文件的 md5/sha1/sha256/sha512；算法省略时返回全部。"
+
+[[tool]]
+name = "text.regex"
+group = "text"
+risk = "none"
+summary = "用正则处理文本：mode = find（首个）| find_all（全部）| capture（捕获组）| replace（替换）。"
+
+[[tool]]
+name = "text.transform"
+group = "text"
+risk = "none"
+summary = "常见文本变换：json_pretty / json_min / uniq / sort / trim / upper / lower / lines_to_csv / csv_to_lines。"
+
+[[tool]]
+name = "ws.create"
+group = "space"
+risk = "low"
+summary = "创建工作空间（Profile 装配清单）：独立目录、Scope 范围、LLM profile、技能列表、空间工作目录 cwd、启用工具白名单 plugins（dsh 语义：非空时按清单装配，空=全部）。"
+
+[[tool]]
+name = "ws.info"
+group = "space"
+risk = "low"
+summary = "工作空间详情：权限、Scope、LLM profile、技能、目录、token 用量（tok/s 与上下文累计）。name 缺省=活跃空间。"
+
+[[tool]]
+name = "ws.list"
+group = "space"
+risk = "low"
+summary = "列出全部工作空间（含活跃标记、权限、LLM profile、技能）。"
+
+[[tool]]
+name = "ws.memory.append"
+group = "space"
+risk = "low"
+summary = "写入活跃工作空间记忆：kind=daily 追加每日工作日志（append-only，自动带时间戳）；kind=curated 追加精炼长期笔记（3000 字符限额，超限报错提示精炼）。"
+
+[[tool]]
+name = "ws.memory.read"
+group = "space"
+risk = "low"
+summary = "读取活跃工作空间记忆：kind=daily 读指定日期日志（缺省今天）、kind=curated 读精炼笔记、kind=list 列出全部日志日期。"
+
+[[tool]]
+name = "ws.record"
+group = "space"
+risk = "low"
+summary = "记录本轮会话 token 用量到活跃工作空间（prompt/completion tokens 与耗时 ms）。"
+
+[[tool]]
+name = "ws.remove"
+group = "space"
+risk = "medium"
+summary = "删除工作空间定义（目录与数据保留，可重建同名空间接回）。"
+
+[[tool]]
+name = "ws.switch"
+group = "space"
+risk = "low"
+summary = "切换活跃工作空间：ScopeGuard、LLM profile、技能集与数据分库随空间生效（下一次会话装配）。"
+
+[[tool]]
+name = "session.search"
+group = "memory"
+risk = "low"
+summary = "跨会话关键词检索（标题/对话正文/滚动摘要/归档，大小写不敏感），返回命中会话的 id、标题与片段；配合 /recall <id> 可注入旧会话上下文。参数：query(必填)、limit(可选,默认5)"
+
+[[tool]]
+name = "plan.create"
+group = "agent"
+risk = "none"
+summary = "为一个多步骤任务建立结构化计划（任务 DAG），之后每轮都会把计划进度与「可执行的下一步」回填给你。参数：objective(必填，一句话目标)；tasks(必填，数组，每项 {id,title,deps?,needs?})。id 自己起短名（如 s1/s2）；deps 填前置任务 id，无依赖留空。只读小任务不必建计划；重建计划会覆盖旧计划（已有进度会丢失）。"
+
+[[tool]]
+name = "plan.update"
+group = "agent"
+risk = "none"
+summary = "更新计划中某一步的状态。参数：id(必填，任务 id)；status(必填，doing/done/blocked/todo)；note(可选，一句话说明结果或受阻原因)。完成一步就标 done，不要攒到最后一起标——下一步的可用性由依赖关系决定。"
+
+[[tool]]
+name = "plan.view"
+group = "agent"
+risk = "none"
+summary = "查看当前计划与进度（无参数）。计划每轮会自动回填，通常不必主动调用；长对话后不确定做到哪一步时再用。"
+
+[[tool]]
+name = "subagent.spawn"
+group = "agent"
+risk = "high"
+summary = "派生一个受限子代理独立执行子任务并取回最终结论（子代理工具面仅含低/中风险工具，高危动作一律被拒；单层派生不可再嵌套）。适合：把可并行的独立子任务隔离执行、避免子任务上下文污染主对话。参数：task(必填，子任务完整描述与预期产出)、max_rounds(可选,2-8,默认6). 返回 stopReason（completed=已得出结论 / max_rounds=轮数耗尽 / failed=执行失败）与结论全文。"
+

@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wpa-api",
+    "crates/plugin-abi",
+    "crates/browser-core",
+    "crates/wpa-kit",
+    "crates/plugin-host",
+    "crates/kern-core",
+    "crates/base-store",
+    "crates/toolkit-core",
+    "crates/base-llm",
+    "crates/base-mcp",
+    "crates/base-skills",
+    "crates/agent-core",
+    "crates/shell-core",
+    "crates/workspace-core",
+    "crates/knowledge-core",
+    "crates/tree-core",
+    "crates/net-core",
+    "crates/text-core",
+    "crates/wpa-engine",
+    "crates/wpa-desktop",
+    "crates/wpa-cli",
+]
+
+# 依赖方向铁律（CI 检查）：
+# 1) 本 workspace 任何 crate 不得依赖 pentest-tree 或任何 feat-*/ext-* 业务 crate；
+# 2) 基座不认识任何专业领域词汇，只认 wpa-api 的群组契约。
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+authors = ["windpencilagent Team"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "1"
+sled = "0.34"
+
+
+# 不要加 "cookies"：本项目所有 Cookie 都由 browser-core::CookieJar 自己实现
+#（reqwest 的 Jar 只写不给读，导不出会话），cookies feature 会白拉 cookie_store + publicsuffix
+reqwest = { version = "0.12", features = ["json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+indexmap = { version = "2", features = ["serde"] }
+futures-util = "0.3"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+regex = "1"
+
+[profile.release]
+lto = "thin"
+strip = true

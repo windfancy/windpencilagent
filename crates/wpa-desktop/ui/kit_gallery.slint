@@ -1,0 +1,292 @@
+// Kit 组件库预览页：把 ui/kit 下全部组件接入并实例化，
+// 既作设计参考，也作为"组件可编译可用"的机械自检（Q-1）。
+
+import { Theme } from "kit/tokens.slint";
+import { ScrollView } from "std-widgets.slint";
+import { Button } from "kit/components/button.slint";
+import { Input } from "kit/components/input.slint";
+import { Checkbox } from "kit/components/checkbox.slint";
+import { Switch } from "kit/components/switch.slint";
+import { Slider } from "kit/components/slider.slint";
+import { ProgressBar } from "kit/components/progress_bar.slint";
+import { Badge, BadgeStatus } from "kit/components/badge.slint";
+import { Separator } from "kit/components/separator.slint";
+import { Spinner } from "kit/components/spinner.slint";
+import { Led } from "kit/components/led.slint";
+import { Card } from "kit/components/card.slint";
+import { Avatar } from "kit/components/avatar.slint";
+import { Alert } from "kit/components/alert.slint";
+import { AccordionItem } from "kit/components/accordion.slint";
+import { Collapsible } from "kit/components/collapsible.slint";
+import { Toggle } from "kit/components/toggle.slint";
+import { ToggleGroup } from "kit/components/toggle_group.slint";
+import { RadioGroup } from "kit/components/radio_group.slint";
+import { Stepper } from "kit/components/stepper.slint";
+import { Roller } from "kit/components/roller.slint";
+import { Combobox } from "kit/components/combobox.slint";
+import { Select } from "kit/components/select.slint";
+import { Textarea } from "kit/components/textarea.slint";
+import { TabWidget } from "kit/components/tab_widget.slint";
+import { Skeleton } from "kit/components/skeleton.slint";
+import { Arc } from "kit/components/arc.slint";
+import { Gauge } from "kit/components/gauge.slint";
+import { RadialGauge } from "kit/components/radial_gauge.slint";
+import { Scale } from "kit/components/scale.slint";
+import { Chart } from "kit/components/chart.slint";
+import { RollingChart } from "kit/components/rolling_chart.slint";
+import { SplitChart } from "kit/components/split_chart.slint";
+import { Table, TableColumn } from "kit/components/table.slint";
+import { FlickableList } from "kit/components/flickable_list.slint";
+import { ScrollArea } from "kit/components/scroll_area.slint";
+import { ButtonMatrix } from "kit/components/button_matrix.slint";
+import { Tooltip } from "kit/components/tooltip.slint";
+import { HoverCard } from "kit/components/hover_card.slint";
+import { Toast } from "kit/components/toast.slint";
+import { Dialog } from "kit/components/dialog.slint";
+import { Drawer } from "kit/components/drawer.slint";
+import { Sheet } from "kit/components/sheet.slint";
+import { AlertDialog } from "kit/components/alert_dialog.slint";
+import { Carousel } from "kit/components/carousel.slint";
+import { Keypad } from "kit/components/keypad.slint";
+import { PinPad } from "kit/components/pinpad.slint";
+import { VirtualKeyboard } from "kit/components/keyboard.slint";
+import { Titlebar } from "kit/components/titlebar.slint";
+import { ActionButton } from "kit/components/base_panel.slint";
+import { KeypadButton } from "kit/components/keypad.slint";
+import { BasePanel } from "kit/components/base_panel.slint";
+
+component Cell inherits Rectangle {
+    in property <string> label;
+    horizontal-stretch: 1;
+    min-height: 150px;
+    background: Theme.palette.surface_raised;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.palette.border;
+    clip: true;
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+        Text {
+            text: root.label;
+            color: Theme.palette.text_secondary;
+            font-size: 11px;
+            height: 16px;
+        }
+        @children
+    }
+}
+
+component Row inherits Rectangle {
+    horizontal-stretch: 1;
+    min-height: 150px;
+    HorizontalLayout {
+        spacing: 10px;
+        @children
+    }
+}
+
+export component KitGallery inherits Rectangle {
+    background: Theme.palette.background;
+
+    ScrollView {
+        viewport-width: self.width;
+
+        VerticalLayout {
+            padding: 16px;
+            spacing: 10px;
+
+            Text {
+                text: "组件库（ui/kit 全量接入）";
+                color: Theme.palette.text_primary;
+                font-size: 15px;
+                font-weight: 600;
+            }
+            Text {
+                text: "共 51 个组件，全部来自 windPencilBot 的 ui/kit 设计系统（纯 Slint，无外部依赖）。此处用于设计对齐与编译自检。";
+                color: Theme.palette.text_secondary;
+                font-size: 11px;
+                wrap: word-wrap;
+            }
+
+            Row {
+                Cell { label: "Button / 主次禁用";
+                    Button { text: "主按钮"; }
+                    Button { text: "描边按钮"; outlined: true; }
+                    Button { text: "禁用"; disabled: true; }
+                }
+                Cell { label: "Input / Checkbox / Switch";
+                    Input { placeholder-text: "输入文本"; }
+                    Checkbox { text: "复选项"; checked: true; }
+                    Switch { checked: true; }
+                }
+                Cell { label: "Slider / Progress / Badge";
+                    Slider { min: 0; max: 100; value: 42; }
+                    ProgressBar { progress: 0.62; }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Badge { text: "成功"; status: BadgeStatus.success; }
+                        Badge { text: "警告"; status: BadgeStatus.warning; }
+                        Badge { text: "危险"; status: BadgeStatus.critical; }
+                    }
+                }
+            }
+
+            Row {
+                Cell { label: "Separator / Spinner / Led";
+                    Separator { }
+                    Spinner { size: 28px; stroke-width: 3px; }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Led { active: true; led-color: Theme.palette.success; label: "ON"; }
+                        Led { active: false; label: "OFF"; }
+                    }
+                }
+                Cell { label: "Card / Avatar";
+                    Card { title: "卡片标题"; description: "卡片描述文字，用于信息分组。"; interactive: true; }
+                    Avatar { has-image: false; fallback: "WB"; }
+                }
+                Cell { label: "Alert";
+                    Alert { title: "提示"; description: "默认提示样式"; }
+                    Alert { title: "危险"; description: "破坏性操作确认"; variant: "destructive"; }
+                }
+            }
+
+            Row {
+                Cell { label: "AccordionItem / Collapsible";
+                    AccordionItem { title: "折叠项一"; }
+                    Collapsible { title: "可折叠区块"; }
+                }
+                Cell { label: "Toggle / ToggleGroup";
+                    Toggle { text: "开关按钮"; pressed: true; }
+                    ToggleGroup { options: ["日", "周", "月"]; selected-index: 0; }
+                }
+                Cell { label: "RadioGroup";
+                    RadioGroup { options: ["选项 A", "选项 B", "选项 C"]; selected-index: 1; }
+                }
+            }
+
+            Row {
+                Cell { label: "Stepper / Roller";
+                    Stepper { value: 42; min: 0; max: 100; unit: "%"; }
+                    Roller { options: ["一月", "二月", "三月"]; selected-index: 0; }
+                }
+                Cell { label: "Combobox / Select";
+                    Combobox { options: ["deepseek", "qwen", "ollama"]; placeholder: "选择模型"; }
+                    Select { options: ["全局", "项目 A", "项目 B"]; }
+                }
+                Cell { label: "Textarea";
+                    Textarea { placeholder-text: "多行输入…"; }
+                }
+            }
+
+            Row {
+                Cell { label: "TabWidget";
+                    TabWidget { tabs: ["概览", "明细", "设置"]; active-tab: 0; }
+                }
+                Cell { label: "Skeleton";
+                    Skeleton { }
+                    Skeleton { is-circle: true; }
+                }
+                Cell { label: "Arc / Scale";
+                    Arc { value: 0.66; }
+                    Scale { tick-count: 12; }
+                }
+            }
+
+            Row {
+                Cell { label: "Gauge";
+                    Gauge { value: 62; label: "CTX"; unit: "%"; }
+                }
+                Cell { label: "RadialGauge";
+                    RadialGauge { value: 0.48; label: "LOAD"; }
+                }
+                Cell { label: "Led 组";
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Led { active: true; led-color: Theme.palette.primary; }
+                        Led { active: true; led-color: Theme.palette.warning; }
+                        Led { active: false; led-color: Theme.palette.critical; }
+                    }
+                }
+            }
+
+            Row {
+                Cell { label: "Chart";
+                    Chart { data-set: [10, 28, 22, 40, 36, 55, 48, 62, 58, 70]; }
+                }
+                Cell { label: "RollingChart";
+                    RollingChart { data-set: [12, 24, 18, 32, 26, 44]; }
+                }
+                Cell { label: "SplitChart";
+                    SplitChart { current-value: 36; history-data: [20, 24, 22, 30, 28, 36]; }
+                }
+            }
+
+            Row {
+                Cell { label: "Table";
+                    Table {
+                        columns: [
+                            { title: "工具", width: 120px },
+                            { title: "风险", width: 70px },
+                            { title: "说明", width: 160px }
+                        ];
+                        data: [
+                            ["util.echo", "Low", "回显"],
+                            ["ws.list", "Low", "空间列表"],
+                            ["os.exec", "High", "命令执行"]
+                        ];
+                    }
+                }
+                Cell { label: "FlickableList / ScrollArea";
+                    FlickableList { items: ["条目一", "条目二", "条目三", "条目四"]; }
+                    ScrollArea { }
+                }
+                Cell { label: "ButtonMatrix";
+                    ButtonMatrix { buttons: ["1", "2", "3", "4", "5", "6"]; cols: 3; }
+                }
+            }
+
+            Row {
+                Cell { label: "Tooltip";
+                    Tooltip { text: "提示文本"; }
+                }
+                Cell { label: "HoverCard";
+                    HoverCard { trigger-text: "悬停查看"; }
+                }
+                Cell { label: "Toast";
+                    Toast { title: "已保存"; description: "配置写入成功"; variant: "success"; show-toast: true; }
+                }
+            }
+
+            Row {
+                Cell { label: "Dialog / Drawer / Sheet（默认关闭）";
+                    Dialog { title: "对话框"; description: "调用 is-open 打开"; }
+                    Drawer { title: "抽屉"; is-open: false; }
+                    Sheet { title: "侧栏面板"; is-open: false; }
+                }
+                Cell { label: "AlertDialog / Carousel";
+                    AlertDialog { title: "确认删除"; description: "该操作不可撤销"; is-open: false; }
+                    Carousel { }
+                }
+                Cell { label: "Titlebar / ActionButton";
+                    Titlebar { title: "标题栏"; time: "12:00"; }
+                    ActionButton { icon: "⌂"; }
+                    KeypadButton { text: "✓"; }
+                }
+            }
+
+            Row {
+                Cell { label: "Keypad / PinPad / VirtualKeyboard";
+                    Keypad { }
+                    PinPad { }
+                    VirtualKeyboard { }
+                }
+                Cell { label: "BasePanel（导航面板）";
+                    BasePanel { title: "BasePanel"; show-back: true; show-home: true; }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,40 @@
+import { Theme } from "../tokens.slint";
+
+export component Tooltip {
+    in property <string> text: "";
+    
+    width: 100%;
+    height: 100%;
+    
+    @children
+    
+    ta := TouchArea {
+        width: 100%;
+        height: 100%;
+    }
+    
+    // Slint 1.13 不允许条件化 PopupWindow（"PopupWindow cannot be directly
+    // repeated or conditional"）。这里改为绝对定位的普通元素：Slint 默认不裁剪
+    // 超出父级的内容，所以它仍可显示在组件下方，只是无法越出窗口边界。
+    if (ta.has-hover) : Rectangle {
+        x: 0;
+        y: root.height + Theme.spacing.xs;
+        width: max(root.width, 80px);
+        height: 26px;
+        border-radius: Theme.spacing.xs;
+        background: Theme.palette.text_primary; // inverted for tooltip
+        clip: false;
+
+        Text {
+            x: Theme.spacing.sm;
+            width: parent.width - Theme.spacing.sm * 2;
+            height: parent.height;
+            text: root.text;
+            font-family: Theme.typography.font_family;
+            font-size: Theme.typography.caption_size;
+            color: Theme.palette.surface;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}

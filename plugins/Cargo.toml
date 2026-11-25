@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+# 只保留 SDK：本仓库不携带业务工具插件。
+# 新插件用 `wpa-cli new-plugin`（或 docs/插件开发规范.md）生成后加到 members。
+members = [
+    "file/file.demo","plugin-sdk", "file/file.path_info"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+serde_json = "1"
+plugin-sdk = { path = "plugin-sdk" }
+
+# 插件是 cdylib：lto + strip 把 75 个插件的总体积压到 ~10MB。
+# panic 必须是 unwind —— SDK 靠 catch_unwind 兜住插件内部 panic，
+# 改成 abort 会让任何一个插件 panic 直接带走整个进程。
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+panic = "unwind"

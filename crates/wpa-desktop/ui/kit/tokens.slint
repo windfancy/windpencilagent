@@ -1,0 +1,89 @@
+export struct PaletteData {
+    background: color,
+    surface: color,
+    surface_raised: color,
+    text_primary: color,
+    text_secondary: color,
+    text_disabled: color,
+    primary: color,
+    on_primary: color,
+    success: color,
+    warning: color,
+    critical: color,
+    on_status: color,
+    border: color,
+    hover_overlay: color,
+    pressed_overlay: color,
+}
+
+export struct SpacingData {
+    xs: length,
+    sm: length,
+    md: length,
+    lg: length,
+    xl: length,
+}
+
+export struct TypographyData {
+    font_family: string,
+    header_size: length,
+    header_weight: int,
+    body_size: length,
+    body_weight: int,
+    caption_size: length,
+    caption_weight: int,
+}
+
+export struct AnimationData {
+    fast: duration,
+    normal: duration,
+    slow: duration,
+}
+
+export global Theme {
+    in-out property <bool> is_dark: false;
+    in-out property <bool> enable_high_fidelity: true;
+
+    // windPencilBot 双主题语义色（与 desktop.slint 的 Theme 令牌同源，WCAG AA 复算）
+    out property <PaletteData> palette: {
+        background: root.is_dark ? #1b1d21 : #f2f3f5,
+        surface: root.is_dark ? #202329 : #e7e9ee,
+        surface_raised: root.is_dark ? #262a31 : #ffffff,
+        text_primary: root.is_dark ? #e8eaf0 : #1d2129,
+        text_secondary: root.is_dark ? #8a93a3 : #55606e,
+        text_disabled: root.is_dark ? #5c6575 : #98a1ad,
+        primary: root.is_dark ? #7cc4ff : #185fa5,
+        on_primary: root.is_dark ? #0d1a26 : #ffffff,
+        success: root.is_dark ? #5ad48a : #3b6d11,
+        warning: root.is_dark ? #e69628 : #854f0b,
+        critical: root.is_dark ? #f09595 : #a32d2d,
+        on_status: root.is_dark ? #0d1a26 : #ffffff,
+        border: root.is_dark ? #2e323a : #d6dae2,
+        hover_overlay: root.is_dark ? rgba(255, 255, 255, 0.08) : rgba(0, 0, 0, 0.04),
+        pressed_overlay: root.is_dark ? rgba(255, 255, 255, 0.12) : rgba(0, 0, 0, 0.12),
+    };
+
+    out property <SpacingData> spacing: {
+        xs: 4px,
+        sm: 8px,
+        md: 12px,
+        lg: 16px,
+        xl: 24px,
+    };
+
+    out property <TypographyData> typography: {
+        font_family: "Microsoft YaHei UI",
+        header_size: 15px,
+        header_weight: 500,
+        body_size: 13px,
+        body_weight: 400,
+        caption_size: 11px,
+        caption_weight: 400,
+    };
+
+    in-out property <AnimationData> animation: {
+        fast: 150ms,
+        normal: 250ms,
+        slow: 400ms,
+    };
+}

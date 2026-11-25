@@ -1,0 +1,23 @@
+[package]
+name = "text-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "基座文本原语：编解码 / 哈希 / 正则 / 结构化提取 / 变换"
+
+[dependencies]
+kern-core = { path = "../kern-core" }
+toolkit-core = { path = "../toolkit-core" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+regex = { workspace = true }
+# 注意：包名 md-5，但 crate 名是 md5（代码里 `use md5::Md5`），不能按包名反推
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { workspace = true }

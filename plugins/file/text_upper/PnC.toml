@@ -1,0 +1,16 @@
+# 声明式插件（无 dll）：验证「[[tool]] + exec」与 dll 插件走同一条扫描/注册表链路。
+id = "file.text_upper"
+name = "文本转大写"
+version = "0.1.0"
+description = "把输入文本转大写。声明式示例：实现就是一段命令，不需要编译。"
+
+[capabilities]
+tags = ["file"]
+
+[[tool]]
+name = "file.text_upper"
+description = "把输入文本转大写（声明式，无 dll）"
+risk = "low"
+concurrency_safe = true
+exec = { kind = "command", program = "powershell", args = ["-NoProfile", "-Command", "$s = [Console]::In.ReadToEnd(); $s.ToUpper()"], stdin = "{{text}}" }
+parameters = { type = "object", required = ["text"], properties = { text = { type = "string", description = "要转大写的文本" } } }

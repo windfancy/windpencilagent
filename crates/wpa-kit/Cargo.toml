@@ -1,0 +1,8 @@
+[package]
+name = "wpa-kit"
+version.workspace = true
+edition.workspace = true
+description = "插件与宿主共用的纯工具库：编解码/哈希/文本/HTML/差分"
+
+[dependencies]
+serde_json = { workspace = true }
