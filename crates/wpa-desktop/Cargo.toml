@@ -31,6 +31,7 @@ slint = { version = "=1.19.0", default-features = false, features = [
     "compat-1-2",
 ] }
 wpa-engine = { path = "../wpa-engine" }
+knowledge-core = { path = "../knowledge-core" }
 kern-core = { path = "../kern-core" }
 base-llm = { path = "../base-llm" }
 agent-core = { path = "../agent-core" }

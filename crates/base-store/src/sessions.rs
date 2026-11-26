@@ -3,6 +3,8 @@
 //! 一条会话 = sled domain `sess` 下的一条记录；数据根随活跃工作空间分库，
 //! 与经验库/任务库一致（exe 同级 data/ 或 workspaces/<name>/data/）。
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{Store, StoreError};
@@ -276,6 +278,90 @@ impl SessionStore {
     pub fn flush(&self) -> Result<(), StoreError> {
         self.db.flush()
     }
+
+    /// 按空间过滤会话（按更新时间倒序）；workspace 为空时返回全部。
+    pub fn list_by_workspace(&self, workspace: &str) -> Vec<SessionRecord> {
+        let all = self.all();
+        if workspace.is_empty() {
+            return all;
+        }
+        all.into_iter().filter(|r| r.workspace == workspace).collect()
+    }
+
+    /// 导出会话头 + 全部消息为 JSONL：每行一个 `{"session":…, "message":…}` 对象。
+    ///
+    /// 首行是会话头（`session` = 去掉 messages 的会话字段，`message` = null），
+    /// 之后每行一条消息（`session` = 会话 id）。目录不存在则创建，原子写。
+    pub fn export_jsonl(&self, id: &str, path: &Path) -> Result<(), String> {
+        let rec = self.get(id).ok_or_else(|| format!("会话不存在：{id}"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("创建导出目录 {} 失败：{e}", parent.display()))?;
+        }
+        let mut lines: Vec<String> = Vec::new();
+
+        let mut header = serde_json::to_value(&rec)
+            .map_err(|e| format!("序列化会话头失败：{e}"))?;
+        if let Some(obj) = header.as_object_mut() {
+            obj.remove("messages"); // 消息另起行，头里不重复
+        }
+        lines.push(
+            serde_json::to_string(&serde_json::json!({ "session": header, "message": null }))
+                .map_err(|e| format!("序列化导出首行失败：{e}"))?,
+        );
+        for msg in &rec.messages {
+            lines.push(
+                serde_json::to_string(&serde_json::json!({ "session": id, "message": msg }))
+                    .map_err(|e| format!("序列化消息行失败：{e}"))?,
+            );
+        }
+        let mut text = lines.join("\n");
+        text.push('\n');
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = path.with_extension(format!("tmp-{}-{}", std::process::id(), nanos));
+        std::fs::write(&tmp, &text)
+            .map_err(|e| format!("写入临时文件 {} 失败：{e}", tmp.display()))?;
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("原子替换 {} 失败：{e}", path.display())
+        })
+    }
+
+    /// 最近 limit 条消息的可读摘要：`角色: 截断文本`（每行 ≤120 字）。
+    pub fn recall_preview(&self, id: &str, limit: usize) -> Result<Vec<String>, String> {
+        let rec = self.get(id).ok_or_else(|| format!("会话不存在：{id}"))?;
+        if limit == 0 || rec.messages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let start = rec.messages.len().saturating_sub(limit);
+        Ok(rec.messages[start..]
+            .iter()
+            .map(|m| {
+                let tag = match m.role {
+                    0 => "用户",
+                    1 => "智能体",
+                    2 => "轨迹",
+                    3 => "提示",
+                    4 => "轮次",
+                    5 => "工具结果",
+                    _ => "消息",
+                };
+                let prefix = format!("{tag}: ");
+                // 预留 1 字给截断省略号，保证整行 ≤120 字
+                let room = 120usize.saturating_sub(prefix.chars().count() + 1);
+                let chars: Vec<char> = m.text.trim().chars().collect();
+                let mut body: String = chars.iter().take(room).collect();
+                if chars.len() > room {
+                    body.push('…');
+                }
+                format!("{prefix}{body}")
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -370,5 +456,92 @@ mod tests {
         store.save(&rec).unwrap();
         let back = store.get("old-1").unwrap();
         assert_eq!(back.messages[0].role, 0);
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("sess-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn list_by_workspace_filters_and_keeps_order() {
+        let store = SessionStore::open_tmp().unwrap();
+        let _global = store.create("G", "", "").unwrap();
+        let w1a = store.create("W1a", "ws1", "").unwrap();
+        let w2 = store.create("W2", "ws2", "").unwrap();
+        let w1b = store.create("W1b", "ws1", "").unwrap();
+        assert_eq!(store.list_by_workspace("").len(), 4, "空 workspace 返回全部");
+        let ws1 = store.list_by_workspace("ws1");
+        assert_eq!(ws1.len(), 2);
+        assert_eq!(ws1[0].id, w1b.id, "最近创建的在前");
+        assert_eq!(ws1[1].id, w1a.id);
+        assert_eq!(store.list_by_workspace("ws2")[0].id, w2.id);
+        assert!(store.list_by_workspace("nope").is_empty());
+    }
+
+    #[test]
+    fn export_jsonl_writes_header_and_messages() {
+        let store = SessionStore::open_tmp().unwrap();
+        let rec = store.create("导出测试", "ws1", "p").unwrap();
+        store
+            .append_messages(
+                &rec.id,
+                &[
+                    StoredMessage::plain(0, "你好"),
+                    StoredMessage {
+                        role: 1,
+                        text: "收到".into(),
+                        tool_calls: Some("[]".into()),
+                        tool_call_id: None,
+                    },
+                ],
+            )
+            .unwrap();
+        let dir = tmp_dir("export");
+        let path = dir.join("nested/session.jsonl"); // 父目录不存在，应自动创建
+        store.export_jsonl(&rec.id, &path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "会话头 + 两条消息");
+        let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(header["session"]["id"].as_str().unwrap(), rec.id);
+        assert_eq!(header["session"]["title"].as_str().unwrap(), "导出测试");
+        assert!(header["session"].get("messages").is_none());
+        assert!(header["message"].is_null());
+        let m0: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(m0["session"].as_str().unwrap(), rec.id);
+        assert_eq!(m0["message"]["role"].as_u64().unwrap(), 0);
+        assert_eq!(m0["message"]["text"].as_str().unwrap(), "你好");
+
+        // 错误路径：会话不存在
+        assert!(store.export_jsonl("not-exist", &path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_preview_truncates_and_returns_recent() {
+        let store = SessionStore::open_tmp().unwrap();
+        let rec = store.create("预览", "", "").unwrap();
+        store
+            .append_messages(
+                &rec.id,
+                &[
+                    StoredMessage::plain(0, "第一条"),
+                    StoredMessage::plain(1, "第二条"),
+                    StoredMessage::plain(5, &"长".repeat(200)),
+                ],
+            )
+            .unwrap();
+        assert!(store.recall_preview("not-exist", 3).is_err());
+        assert!(store.recall_preview(&rec.id, 0).unwrap().is_empty());
+        let preview = store.recall_preview(&rec.id, 2).unwrap();
+        assert_eq!(preview.len(), 2);
+        assert!(preview[0].starts_with("智能体: 第二条"), "{preview:?}");
+        assert!(preview[1].starts_with("工具结果: "), "{preview:?}");
+        assert!(preview.iter().all(|s| s.chars().count() <= 120));
     }
 }

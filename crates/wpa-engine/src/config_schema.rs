@@ -15,6 +15,8 @@ use crate::config::{AppConfig, ConfigSection};
 pub enum FieldKind {
     Bool,
     Int { min: i64, max: i64, step: i64 },
+    /// 滑杆（界面拖拽设置；语义与 Int 相同，仅展示方式不同）
+    Slider { min: i64, max: i64 },
     Float { min: f64, max: f64, step: f64 },
     /// 单行文本
     Text,
@@ -185,8 +187,8 @@ pub fn cards() -> Vec<Card> {
                 f(
                     "app.font_size",
                     "界面字号",
-                    "10~24 px。全局字号落在各控件的固定高度上，改完需重启。",
-                    FieldKind::Int { min: 10, max: 24, step: 1 },
+                    "10~24 px。拖动滑杆设置；改完需重启。",
+                    FieldKind::Slider { min: 10, max: 24 },
                     ConfigSection::App,
                 ),
                 f(
@@ -549,6 +551,20 @@ pub fn cards() -> Vec<Card> {
                     ConfigSection::Sandbox,
                 ),
                 f(
+                    "sandbox.python_path",
+                    "Python 解释器路径",
+                    "留空自动探测（程序子目录 python/python.exe）。填绝对路径可指定解释器；改完需重启生效。",
+                    FieldKind::Path { dir: false },
+                    ConfigSection::Sandbox,
+                ),
+                f(
+                    "sandbox.pip_path",
+                    "pip 路径",
+                    "留空自动探测（程序子目录 python/python.exe）——用其同目录的 pip（python -m pip）。填绝对路径可指定 pip 可执行文件；改完需重启生效。",
+                    FieldKind::Path { dir: false },
+                    ConfigSection::Sandbox,
+                ),
+                f(
                     "run.auto_approve",
                     "自动批准全部工具",
                     "危险：跳过人工审批。仅自动化脚本场景使用，交互使用请保持关闭。",
@@ -848,6 +864,8 @@ impl AppConfig {
             "net.per_host_qps" => self.net.per_host_qps.to_string(),
             "sandbox.restricted_token" => self.sandbox.restricted_token.to_string(),
             "sandbox.app_container" => self.sandbox.app_container.to_string(),
+            "sandbox.python_path" => self.sandbox.python_path.clone().unwrap_or_default(),
+            "sandbox.pip_path" => self.sandbox.pip_path.clone().unwrap_or_default(),
             "run.auto_approve" => self.run.auto_approve.to_string(),
             "run.approval_timeout_secs" => {
                 self.run.approval_timeout_secs.map(|v| v.to_string()).unwrap_or_default()
@@ -986,6 +1004,8 @@ impl AppConfig {
             "net.per_host_qps" => self.net.per_host_qps = uint(v)? as u32,
             "sandbox.restricted_token" => self.sandbox.restricted_token = parse_bool(v)?,
             "sandbox.app_container" => self.sandbox.app_container = parse_bool(v)?,
+            "sandbox.python_path" => self.sandbox.python_path = opt_text(v),
+            "sandbox.pip_path" => self.sandbox.pip_path = opt_text(v),
             "run.auto_approve" => self.run.auto_approve = parse_bool(v)?,
             "run.approval_timeout_secs" => self.run.approval_timeout_secs = Some(uint(v)?),
             "scope.authorized" => self.scope.authorized = parse_list(v),
@@ -1055,7 +1075,7 @@ mod tests {
                     None => continue, // 无候选（如 domains 目录还不存在）
                 },
                 FieldKind::Bool => "true".to_string(),
-                FieldKind::Int { min, .. } => min.to_string(),
+                FieldKind::Int { min, .. } | FieldKind::Slider { min, .. } => min.to_string(),
                 FieldKind::Float { min, .. } => format!("{min}"),
                 FieldKind::Enum { options } => options.last().unwrap().to_string(),
                 FieldKind::List => "a\nb".to_string(),
@@ -1068,6 +1088,37 @@ mod tests {
             assert_ne!(after, "", "{} 写后读为空", f.key);
             assert!(before != after || sample == before, "{} 写入未生效", f.key);
         }
+    }
+
+    #[test]
+    fn sandbox_path_fields_none_roundtrip_as_empty_string() {
+        let mut cfg = AppConfig::default();
+        assert!(cfg.sandbox.python_path.is_none());
+        assert!(cfg.sandbox.pip_path.is_none());
+        assert_eq!(cfg.get_field("sandbox.python_path").unwrap(), "");
+        assert_eq!(cfg.get_field("sandbox.pip_path").unwrap(), "");
+
+        // 卡片登记为文件选择器（非目录），归属沙箱分区
+        for key in ["sandbox.python_path", "sandbox.pip_path"] {
+            let f = field(key).unwrap_or_else(|| panic!("{key} 未登记卡片"));
+            assert_eq!(f.kind, FieldKind::Path { dir: false });
+            assert_eq!(f.section, ConfigSection::Sandbox);
+        }
+
+        cfg.set_field("sandbox.python_path", "C:/tools/python.exe").unwrap();
+        cfg.set_field("sandbox.pip_path", "C:/tools/Scripts/pip.exe").unwrap();
+        assert_eq!(cfg.sandbox.python_path.as_deref(), Some("C:/tools/python.exe"));
+        assert_eq!(cfg.sandbox.pip_path.as_deref(), Some("C:/tools/Scripts/pip.exe"));
+        assert_eq!(cfg.get_field("sandbox.python_path").unwrap(), "C:/tools/python.exe");
+        assert_eq!(cfg.get_field("sandbox.pip_path").unwrap(), "C:/tools/Scripts/pip.exe");
+
+        // 清空（含空白）回到 None，回填给 UI 的是空串
+        cfg.set_field("sandbox.python_path", "").unwrap();
+        cfg.set_field("sandbox.pip_path", "   ").unwrap();
+        assert!(cfg.sandbox.python_path.is_none());
+        assert!(cfg.sandbox.pip_path.is_none());
+        assert_eq!(cfg.get_field("sandbox.python_path").unwrap(), "");
+        assert_eq!(cfg.get_field("sandbox.pip_path").unwrap(), "");
     }
 
     #[test]
@@ -1111,7 +1162,7 @@ mod tests {
                 FieldKind::Action { .. } => continue,
                 FieldKind::Pick { .. } => continue,
                 FieldKind::Bool => "false".to_string(),
-                FieldKind::Int { min, .. } => min.to_string(),
+                FieldKind::Int { min, .. } | FieldKind::Slider { min, .. } => min.to_string(),
                 FieldKind::Float { min, .. } => format!("{min}"),
                 FieldKind::Enum { options } => options[0].to_string(),
                 FieldKind::List => String::new(),

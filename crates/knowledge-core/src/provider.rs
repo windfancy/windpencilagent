@@ -142,6 +142,103 @@ impl FileKnowledgeProvider {
         scored.truncate(limit.max(1));
         scored
     }
+
+    /// 列出知识条目名：`knowledge.md` 的 `##` 二级标题 + `learn.jsonl` 每行的首字段。
+    ///
+    /// 去空、去重；文件不存在视为空。顺序：先手写条目标题，再学习沉淀条目。
+    pub fn list_entries(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        let knowledge = self.base.join("knowledge.md");
+        if let Ok(text) = std::fs::read_to_string(&knowledge) {
+            for line in text.lines() {
+                let t = line.trim();
+                if let Some(title) = t.strip_prefix("## ") {
+                    let title = title.trim();
+                    if !title.is_empty() && seen.insert(title.to_string()) {
+                        out.push(title.to_string());
+                    }
+                }
+            }
+        }
+
+        let learn = self.base.join("learn.jsonl");
+        if let Ok(text) = std::fs::read_to_string(&learn) {
+            for line in text.lines() {
+                let l = line.trim();
+                if l.is_empty() || l.starts_with('#') {
+                    continue;
+                }
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(l) else {
+                    continue;
+                };
+                let Some(obj) = value.as_object() else { continue };
+                // learn.jsonl 由 learn() 写成 KnowledgeEntry，首字段即 id；
+                // 非标准行则退化为对象里第一个字符串字段，保持"首字段"语义。
+                let first = obj
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| obj.values().find_map(serde_json::Value::as_str));
+                if let Some(name) = first {
+                    let name = name.trim();
+                    if !name.is_empty() && seen.insert(name.to_string()) {
+                        out.push(name.to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 追加一个 `## name\n\ntext\n` 段落到 knowledge.md（文件不存在则创建），原子写。
+    pub fn add_entry(&self, name: &str, text: &str) -> Result<(), String> {
+        let path = self.base.join("knowledge.md");
+        let mut out = std::fs::read_to_string(&path).unwrap_or_default();
+        if !out.is_empty() {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n'); // 段间空行
+        }
+        out.push_str(&format!("## {}\n\n{}\n", name.trim(), text));
+        atomic_write(&path, &out)
+    }
+
+    /// 删除 `## name` 段落（到下个 `##` 或文件尾），原子写；找不到报错。
+    pub fn remove_entry(&self, name: &str) -> Result<(), String> {
+        let path = self.base.join("knowledge.md");
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
+        let target = format!("## {}", name.trim());
+        let mut kept: Vec<&str> = Vec::new();
+        let mut removing = false;
+        let mut found = false;
+        for line in text.lines() {
+            let t = line.trim();
+            if t.starts_with("## ") {
+                if removing {
+                    removing = false; // 遇到下一个二级标题即停止删除，并保留该行
+                }
+                if t == target {
+                    found = true;
+                    removing = true;
+                    continue;
+                }
+            }
+            if !removing {
+                kept.push(line);
+            }
+        }
+        if !found {
+            return Err(format!("知识条目不存在：{name}"));
+        }
+        let mut out = kept.join("\n");
+        if text.ends_with('\n') {
+            out.push('\n');
+        }
+        atomic_write(&path, &out)
+    }
 }
 
 #[async_trait]
@@ -194,6 +291,21 @@ impl KnowledgeProvider for FileKnowledgeProvider {
         writeln!(f, "{line}").map_err(|e| format!("写入经验失败：{e}"))?;
         Ok(())
     }
+}
+
+/// 同目录临时文件 + rename，避免读者看到写了一半的 knowledge.md。
+fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("tmp-{}-{}", std::process::id(), nanos));
+    std::fs::write(&tmp, text)
+        .map_err(|e| format!("写入临时文件 {} 失败：{e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("原子替换 {} 失败：{e}", path.display())
+    })
 }
 
 #[cfg(test)]
@@ -298,5 +410,71 @@ mod tests {
             })
             .await;
         assert_eq!(with_exploit.len(), 2);
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let d = std::env::temp_dir().join(format!("kb-entries-{tag}-{}-{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn list_entries_merges_markdown_and_learn_without_duplicates() {
+        let d = tmp_dir("list");
+        std::fs::write(
+            d.join("knowledge.md"),
+            "前言\n\n## 条目A\n说明A\n\n## 条目B\n说明B\n\n##    \n空标题应忽略\n## 条目A\n重复标题\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("learn.jsonl"),
+            "{\"id\":\"exp-00001\",\"title\":\"经验1\",\"body\":\"x\"}\n\n{\"id\":\"条目A\",\"title\":\"重复\"}\n{\"id\":\"\",\"title\":\"空 id\"}\n",
+        )
+        .unwrap();
+        let p = FileKnowledgeProvider::from_dir("kb", &d, &[], None);
+        assert_eq!(p.list_entries(), vec!["条目A", "条目B", "exp-00001"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn list_entries_empty_when_files_missing() {
+        let d = tmp_dir("empty");
+        let p = FileKnowledgeProvider::from_dir("kb", &d, &[], None);
+        assert!(p.list_entries().is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn add_and_remove_entry_roundtrip() {
+        let d = tmp_dir("addrm");
+        let p = FileKnowledgeProvider::from_dir("kb", &d, &[], None);
+
+        // 文件不存在时创建
+        p.add_entry("新条目", "第一条内容").unwrap();
+        let text = std::fs::read_to_string(d.join("knowledge.md")).unwrap();
+        assert_eq!(text, "## 新条目\n\n第一条内容\n");
+        // 追加第二段
+        p.add_entry("第二条", "第二条内容").unwrap();
+        assert_eq!(p.list_entries(), vec!["新条目", "第二条"]);
+
+        // 删除中间段：保留前一段与后一段
+        p.remove_entry("新条目").unwrap();
+        let text = std::fs::read_to_string(d.join("knowledge.md")).unwrap();
+        assert!(!text.contains("新条目"), "被删段落不应残留：{text}");
+        assert!(text.contains("## 第二条\n\n第二条内容\n"));
+        assert_eq!(p.list_entries(), vec!["第二条"]);
+
+        // 删除最后一段（到文件尾）
+        p.remove_entry("第二条").unwrap();
+        assert!(p.list_entries().is_empty());
+
+        // 错误路径：条目不存在
+        assert!(p.remove_entry("不存在").is_err());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

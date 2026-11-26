@@ -94,6 +94,18 @@ pub struct Workspace {
     /// 简述
     #[serde(default)]
     pub note: String,
+    /// 工具审批是否自动通过：None = 跟随全局配置。
+    #[serde(default)]
+    pub auto_approve: Option<bool>,
+    /// 是否启用受限 token：None = 跟随全局配置。
+    #[serde(default)]
+    pub restricted_token: Option<bool>,
+    /// 空间追加的授权目标（与全局 scope 合并）。
+    #[serde(default)]
+    pub extra_scope: Vec<String>,
+    /// 空间追加的红线目标（与全局 deny 合并）。
+    #[serde(default)]
+    pub extra_deny: Vec<String>,
     #[serde(default)]
     pub created_at: u64,
     #[serde(default)]
@@ -140,6 +152,38 @@ impl Workspace {
     /// 该空间是否启用某个树包（`trees` 为空 = 全部启用）。
     pub fn uses_tree(&self, tree_id: &str) -> bool {
         self.trees.is_empty() || self.trees.iter().any(|t| t == tree_id)
+    }
+
+    /// 生效授权目标：全局 + 空间追加，去重（保持顺序：全局优先）。
+    pub fn effective_scope(&self, global: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for s in global.iter().chain(self.extra_scope.iter()) {
+            if !out.contains(s) {
+                out.push(s.clone());
+            }
+        }
+        out
+    }
+
+    /// 生效红线：全局 + 空间追加，去重（保持顺序：全局优先）。
+    pub fn effective_deny(&self, global: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for s in global.iter().chain(self.extra_deny.iter()) {
+            if !out.contains(s) {
+                out.push(s.clone());
+            }
+        }
+        out
+    }
+
+    /// 审批策略：空间没显式设置时跟随全局。
+    pub fn approval(&self, global: bool) -> bool {
+        self.auto_approve.unwrap_or(global)
+    }
+
+    /// 受限 token 策略：空间没显式设置时跟随全局。
+    pub fn restricted(&self, global: bool) -> bool {
+        self.restricted_token.unwrap_or(global)
     }
 }
 
@@ -351,6 +395,17 @@ impl WorkspaceRegistry {
         self.inner.read().expect("lock").workspaces.get(name).cloned()
     }
 
+    /// 更新一个已存在空间的可编辑字段（#9/#14/#15）。
+    /// 名字是主键不可改；整条替换，保留未暴露字段由调用方先 get 再改。
+    pub fn update(&self, w: Workspace) -> Result<(), WsError> {
+        let existed = self.inner.read().expect("lock").workspaces.contains_key(&w.name);
+        if !existed {
+            return Err(WsError::Invalid(format!("空间不存在: {}", w.name)));
+        }
+        self.inner.write().expect("lock").workspaces.insert(w.name.clone(), w);
+        self.save()
+    }
+
     /// 读取空间用量统计（不存在则空表）。
     pub fn usage(&self, name: &str) -> UsageStats {
         let f = self.data_dir(name).join("stats.json");
@@ -460,6 +515,10 @@ impl Tool for WsCreate {
                 .unwrap_or_default(),
             note: args.get("note").and_then(Value::as_str).unwrap_or("").into(),
             created_at: 0, last_active: 0,
+            auto_approve: None,
+            restricted_token: None,
+            extra_scope: Vec::new(),
+            extra_deny: Vec::new(),
         };
         let reg = self.0.clone();
         let name2 = w.name.clone();
@@ -752,6 +811,10 @@ mod tests {
             trees: vec![],
             note: "A 项目授权段".into(),
             created_at: 0, last_active: 0,
+            auto_approve: None,
+            restricted_token: None,
+            extra_scope: Vec::new(),
+            extra_deny: Vec::new(),
         }).unwrap();
         assert_eq!(w.name, "proj-a");
         assert!(reg.workspace_dir("proj-a").join("data").is_dir());
@@ -918,6 +981,59 @@ mod tests {
         .to_vec();
         assert_eq!(names, vec!["ws.create", "ws.list", "ws.switch", "ws.remove", "ws.info", "ws.record",
             "ws.memory.append", "ws.memory.read"]);
+    }
+
+    #[test]
+    fn workspace_config_defaults_and_merge() {
+        let w = Workspace::default();
+        assert_eq!(w.auto_approve, None);
+        assert_eq!(w.restricted_token, None);
+        assert!(w.extra_scope.is_empty());
+        assert!(w.extra_deny.is_empty());
+        // None = 跟随全局
+        assert!(w.approval(true));
+        assert!(!w.approval(false));
+        assert!(w.restricted(true));
+        assert!(!w.restricted(false));
+
+        let global_scope = vec!["10.0.0.0/24".to_string(), "example.com".to_string()];
+        let global_deny = vec!["10.0.0.1".to_string()];
+        let w = Workspace {
+            extra_scope: vec!["example.com".to_string(), "192.168.1.0/24".to_string()],
+            extra_deny: vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()],
+            auto_approve: Some(false),
+            restricted_token: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            w.effective_scope(&global_scope),
+            vec!["10.0.0.0/24", "example.com", "192.168.1.0/24"]
+        );
+        assert_eq!(
+            w.effective_deny(&global_deny),
+            vec!["10.0.0.1", "10.0.0.2"]
+        );
+        // Some 覆盖全局（方向与全局相反）
+        assert!(!w.approval(true));
+        assert!(!w.approval(false));
+        assert!(w.restricted(false));
+        assert!(w.restricted(true));
+    }
+
+    #[test]
+    fn workspace_config_fields_serde_default() {
+        // 旧 workspaces.toml 没有这 4 个字段，必须能反序列化且不丢原字段
+        let old = r#"
+name = "legacy"
+scope = ["10.0.0.0/24"]
+"#;
+        let w: Workspace = toml::from_str(old).unwrap();
+        assert_eq!(w.name, "legacy");
+        assert_eq!(w.scope, vec!["10.0.0.0/24"]);
+        assert_eq!(w.auto_approve, None);
+        assert_eq!(w.restricted_token, None);
+        assert!(w.extra_scope.is_empty());
+        assert!(w.extra_deny.is_empty());
     }
 
     // 手工构造 ExecutionContext（kern-core 无 Default，与 feat-nuclei/feat-tasks 同款）

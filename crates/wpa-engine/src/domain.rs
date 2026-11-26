@@ -446,6 +446,127 @@ pub fn set_groups(domain_toml: &std::path::Path, ids: &[String]) -> Result<(), S
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// 领域 CRUD（自由函数：显式 root，不依赖全局配置，便于上层/测试直接调用）
+// ---------------------------------------------------------------------------
+
+/// 领域 id 校验：非空、仅字母数字与 `_` `-` `.`。
+///
+/// 额外排除 `.` / `..`：它们虽然是"安全字符"，但作为目录名会越出 root
+/// （这是系统边界，必须挡住路径穿越）。
+fn valid_domain_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("领域 id 不能为空".to_string());
+    }
+    if id == "." || id == ".." {
+        return Err(format!("非法领域 id：{id}（不能是 . 或 ..）"));
+    }
+    if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.') {
+        return Err(format!("非法领域 id：{id}（只允许字母数字、_、-、.）"));
+    }
+    Ok(())
+}
+
+/// 领域内可读写的四个描述文件（白名单）。
+fn valid_domain_file(file: &str) -> Result<(), String> {
+    if matches!(file, "domain.toml" | "workflow.md" | "knowledge.md" | "constraints.toml") {
+        Ok(())
+    } else {
+        Err(format!("非法领域文件名：{file}（只允许 domain.toml / workflow.md / knowledge.md / constraints.toml）"))
+    }
+}
+
+/// 同目录临时文件 + rename：读者只会看到写完的整份内容，不会读到半截文件。
+fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("tmp-{}-{}", std::process::id(), nanos));
+    std::fs::write(&tmp, text)
+        .map_err(|e| format!("写入临时文件 {} 失败：{e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("原子替换 {} 失败：{e}", path.display())
+    })
+}
+
+/// 把模板里的 `name = "…"` 行替换成指定名字；找不到就原样返回模板。
+fn replace_template_name(template: &str, name: &str) -> String {
+    let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut done = false;
+    let mut lines: Vec<String> = Vec::new();
+    for line in template.lines() {
+        let trimmed = line.trim_start();
+        let key = trimmed.split('=').next().unwrap_or("").trim();
+        if !done && key == "name" {
+            let indent = &line[..line.len() - trimmed.len()];
+            lines.push(format!("{indent}name = \"{escaped}\""));
+            done = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !done {
+        return template.to_string();
+    }
+    let mut out = lines.join("\n");
+    if template.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// 新建领域：按 `DEFAULT_TEMPLATE` 写四个文件，`domain.toml` 的 name 换成传入值。
+/// 目录已存在时报错（绝不覆盖用户已有领域）。
+pub fn create_domain(root: &Path, id: &str, name: &str) -> Result<(), String> {
+    valid_domain_id(id)?;
+    let dir = root.join(id);
+    if dir.exists() {
+        return Err(format!("领域 {id} 已存在：{}", dir.display()));
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("创建领域目录 {} 失败：{e}", dir.display()))?;
+    for (file, body) in DEFAULT_TEMPLATE {
+        let text = if *file == "domain.toml" {
+            replace_template_name(body, name)
+        } else {
+            (*body).to_string()
+        };
+        atomic_write(&dir.join(file), &text)?;
+    }
+    Ok(())
+}
+
+/// 删除领域（递归）；`default` 是模板基底，永远不允许删除。
+pub fn remove_domain(root: &Path, id: &str) -> Result<(), String> {
+    valid_domain_id(id)?;
+    if id == "default" {
+        return Err("不允许删除默认领域 default".to_string());
+    }
+    let dir = root.join(id);
+    std::fs::remove_dir_all(&dir)
+        .map_err(|e| format!("删除领域目录 {} 失败：{e}", dir.display()))
+}
+
+/// 写领域的单个描述文件（白名单校验 + 需要时建目录 + 原子写）。
+pub fn write_domain_file(root: &Path, id: &str, file: &str, text: &str) -> Result<(), String> {
+    valid_domain_id(id)?;
+    valid_domain_file(file)?;
+    let dir = root.join(id);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("创建领域目录 {} 失败：{e}", dir.display()))?;
+    atomic_write(&dir.join(file), text)
+}
+
+/// 读领域的单个描述文件（白名单校验）。文件不存在时报错。
+pub fn read_domain_file(root: &Path, id: &str, file: &str) -> Result<String, String> {
+    valid_domain_id(id)?;
+    valid_domain_file(file)?;
+    let path = root.join(id).join(file);
+    std::fs::read_to_string(&path).map_err(|e| format!("读取 {} 失败：{e}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,5 +705,67 @@ mod tests {
         let after = std::fs::read_to_string(&p).unwrap();
         assert!(after.contains("我自己改的"), "用户改动被覆盖了：{after}");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn test_root(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("wpa_domain_crud_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn domain_crud_roundtrip() {
+        let root = test_root("roundtrip");
+        create_domain(&root, "my-domain.v2", "我的领域").unwrap();
+        let dir = root.join("my-domain.v2");
+        for (f, _) in DEFAULT_TEMPLATE {
+            assert!(dir.join(f).is_file(), "{f} 应写出");
+        }
+        let manifest = read_domain_file(&root, "my-domain.v2", "domain.toml").unwrap();
+        assert!(manifest.contains("name = \"我的领域\""));
+        assert!(!manifest.contains("name = \"通用对话\""));
+        // 写出的领域应能真正装载（name 替换没破坏 TOML）
+        let pack = load(&dir).unwrap();
+        assert_eq!(pack.manifest.name, "我的领域");
+        assert_eq!(pack.manifest.id, "default", "模板 id 保持不变");
+
+        // 覆盖写 + 读回（原子写路径）
+        let wf = "---\ninject: manual\n---\n新流程\n";
+        write_domain_file(&root, "my-domain.v2", "workflow.md", wf).unwrap();
+        assert_eq!(read_domain_file(&root, "my-domain.v2", "workflow.md").unwrap(), wf);
+
+        // 重复创建报错，且不改动已有内容
+        assert!(create_domain(&root, "my-domain.v2", "另一个名字").is_err());
+        assert_eq!(read_domain_file(&root, "my-domain.v2", "workflow.md").unwrap(), wf);
+
+        remove_domain(&root, "my-domain.v2").unwrap();
+        assert!(!dir.exists());
+        assert!(remove_domain(&root, "my-domain.v2").is_err(), "删除不存在的领域应报错");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn domain_rejects_unsafe_ids_and_files() {
+        let root = test_root("unsafe");
+        for bad in ["", ".", "..", "a/b", "a\\b", "../evil", "中文"] {
+            assert!(create_domain(&root, bad, "x").is_err(), "id {bad:?} 应被拒绝");
+            assert!(write_domain_file(&root, bad, "domain.toml", "x").is_err());
+            assert!(read_domain_file(&root, bad, "domain.toml").is_err());
+        }
+        create_domain(&root, "safe", "安全").unwrap();
+        assert!(write_domain_file(&root, "safe", "evil.toml", "x").is_err());
+        assert!(read_domain_file(&root, "safe", "../domain.toml").is_err());
+        assert!(read_domain_file(&root, "safe", "missing.md").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn default_domain_cannot_be_removed() {
+        let root = test_root("default");
+        create_domain(&root, "default", "自定义名").unwrap();
+        assert!(remove_domain(&root, "default").is_err());
+        assert!(root.join("default/domain.toml").is_file());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

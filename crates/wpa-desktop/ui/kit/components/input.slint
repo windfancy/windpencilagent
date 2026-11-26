@@ -6,6 +6,9 @@ export component Input inherits Rectangle {
     in property <string> placeholder-text <=> input.placeholder-text;
     in property <bool> enabled <=> input.enabled;
     out property <bool> has-focus: input.has-focus;
+    // 转发内部 LineEdit 的提交/编辑回调（供任务新建、组描述等场景用）
+    callback accepted(string);
+    callback edited(string);
 
     in property <string> label;
     in property <bool> has-error: false;
@@ -32,6 +35,8 @@ export component Input inherits Rectangle {
             input := LineEdit {
                 width: 100%;
                 height: 100%;
+                accepted(t) => { root.accepted(t); }
+                edited(t) => { root.edited(t); }
             }
 
             // Error border overlay

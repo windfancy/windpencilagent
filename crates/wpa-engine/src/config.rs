@@ -413,6 +413,14 @@ pub struct SandboxSection {
     pub restricted_token: bool,
     /// 是否尝试 AppContainer 隔离（Win8+；失败回落受限令牌）。
     pub app_container: bool,
+    /// Python 解释器路径；留空/None = 自动探测（程序子目录 python/python.exe）。
+    /// 装配时写入环境变量 WPA_PYTHON_PATH 供 sandbox.python / sandbox.pip 读取。
+    #[serde(default)]
+    pub python_path: Option<String>,
+    /// pip 可执行文件路径；留空/None = 用 python 同目录的 pip（`python -m pip`）。
+    /// 装配时写入环境变量 WPA_PIP_PATH 供 sandbox.pip 读取。
+    #[serde(default)]
+    pub pip_path: Option<String>,
 }
 
 /// 上下文五段预算（比例；和为 1，写歪了会自动归一化）+ 压缩策略。
@@ -858,6 +866,54 @@ impl AppConfig {
         errs
     }
 
+    /// 只校验单个字段：复用 [`Self::validate`] 的逐字段规则，再按 key 过滤无关错误。
+    ///
+    /// SetField 场景里用户一次只改一项；若整表还有别的存量错误（例如手编配置写歪了
+    /// context 比例），不该因此卡住这一次修改。返回空 Vec = 该字段通过。
+    ///
+    /// 匹配口径：校验错误统一以 `[section]` 或 `[section.field]` 开头，取 key 的前两段
+    /// 比对；段级聚合错误（`[app] 窗口尺寸`、`[context] 五项比例`）单独映射到相关字段。
+    pub fn validate_field(&self, key: &str) -> Vec<String> {
+        let key = key.trim();
+        let mut parts = key.split('.');
+        let section = parts.next().unwrap_or("");
+        let field = parts.next().unwrap_or("");
+        if section.is_empty() {
+            return Vec::new();
+        }
+        let token = if field.is_empty() {
+            String::new()
+        } else {
+            format!(".{field}")
+        };
+        self.validate()
+            .into_iter()
+            .filter(|e| {
+                let err_section = e
+                    .strip_prefix('[')
+                    .and_then(|s| s.split_once(']'))
+                    .map(|(s, _)| s)
+                    .unwrap_or("");
+                let section_ok = err_section == section
+                    || (!field.is_empty() && err_section == format!("{section}.{field}"));
+                if !section_ok {
+                    return false;
+                }
+                if token.is_empty() || e.contains(&token) {
+                    return true;
+                }
+                match (section, field) {
+                    ("app", "window_w" | "window_h") => e.contains("窗口尺寸"),
+                    (
+                        "context",
+                        "system" | "knowledge" | "experience" | "tools" | "dialog",
+                    ) => e.contains("五项比例"),
+                    _ => false,
+                }
+            })
+            .collect()
+    }
+
     /// 授权范围优先级：CLI `--target` > 空间授权范围 > 配置文件。
     pub fn merged_scope(&self, cli_targets: &[String]) -> Vec<String> {
         if cli_targets.is_empty() {
@@ -1054,6 +1110,8 @@ auto_approve = false
 # true = os.exec / sandbox.python 经 Windows 受限令牌执行
 restricted_token = false
 app_container = false
+# python_path = "C:/path/to/python.exe"  # 留空 = 自动探测（程序子目录 python/python.exe）
+# pip_path = "C:/path/to/pip.exe"        # 留空 = 用 python 同目录的 pip
 
 [net]
 concurrency = 4
@@ -1230,6 +1288,50 @@ model = "ma"
         let errs = cfg.validate();
         assert!(errs.iter().any(|e| e.contains("active")), "{errs:?}");
         assert!(errs.iter().any(|e| e.contains("fallback")), "{errs:?}");
+    }
+
+    #[test]
+    fn validate_field_only_reports_the_edited_field() {
+        let mut cfg = AppConfig::default();
+        assert!(cfg.validate_field("llm.mode").is_empty());
+        assert!(cfg.validate_field("sandbox.python_path").is_empty());
+        assert!(cfg.validate_field("sandbox.pip_path").is_empty());
+
+        // 两个字段同时非法：整表报两条，单字段各只报自己的一条
+        cfg.llm.mode = "weird".into();
+        cfg.app.font_size = 40;
+        assert_eq!(cfg.validate().len(), 2, "{:?}", cfg.validate());
+        let mode_errs = cfg.validate_field("llm.mode");
+        assert_eq!(mode_errs.len(), 1, "{mode_errs:?}");
+        assert!(mode_errs[0].contains("mode"));
+        let font_errs = cfg.validate_field("app.font_size");
+        assert_eq!(font_errs.len(), 1, "{font_errs:?}");
+        assert!(font_errs[0].contains("font_size"));
+        // 同一段内的别的字段、以及无校验规则的新路径字段都不被牵连
+        assert!(cfg.validate_field("app.theme").is_empty());
+        assert!(cfg.validate_field("sandbox.python_path").is_empty());
+        assert!(cfg.validate_field("sandbox.pip_path").is_empty());
+
+        cfg.llm.mode = "agent".into();
+        assert!(cfg.validate_field("llm.mode").is_empty());
+        assert_eq!(cfg.validate_field("app.font_size").len(), 1);
+    }
+
+    #[test]
+    fn validate_field_maps_section_level_aggregate_errors() {
+        let mut cfg = AppConfig::default();
+        cfg.app.window_w = 100.0;
+        assert_eq!(cfg.validate_field("app.window_w").len(), 1);
+        assert_eq!(cfg.validate_field("app.window_h").len(), 1);
+        assert!(cfg.validate_field("app.theme").is_empty());
+
+        let mut cfg = AppConfig::default();
+        cfg.context.dialog = 0.1; // 破坏五段耦合约束 + dialog 下限
+        let errs = cfg.validate_field("context.dialog");
+        assert_eq!(errs.len(), 2, "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("五项比例")));
+        assert!(errs.iter().any(|e| e.contains("dialog")));
+        assert!(cfg.validate_field("net.concurrency").is_empty());
     }
 
     #[test]

@@ -1,10 +1,12 @@
 //! windpencilagent 桌面端（Slint）：UI 线程只做渲染，引擎在独立线程（见 `engine_thread`）。
 
+pub mod clipboard;
 pub mod engine_thread;
+pub mod native_dialog;
 
 use std::path::PathBuf;
 
-use slint::ComponentHandle;
+use slint::{ComponentHandle, Model};
 
 use engine_thread::Cmd;
 
@@ -290,6 +292,149 @@ fn run_inner(config_path: PathBuf) -> anyhow::Result<()> {
         let h = handle.tx.clone();
         app.on_tree_reload(move || {
             let _ = h.send(Cmd::ReloadTree);
+        });
+    }
+
+    // ---- 本轮 20 条改动新增回调 ----
+    // 对话页：选择器 + 复制
+    {
+        let h = handle.tx.clone();
+        app.on_space_select(move |name| { let _ = h.send(Cmd::SwitchSpace(name.to_string())); });
+    }
+    {
+        let h = handle.tx.clone();
+        let weak = app.as_weak();
+        app.on_domain_select(move |name| {
+            // 下拉给的是领域显示名，按名字从界面持有的 domains 里查 id 再切
+            let id = weak.upgrade()
+                .and_then(|a| {
+                    let model = a.get_domains();
+                    (0..model.row_count())
+                        .filter_map(|i| model.row_data(i))
+                        .find(|d| d.name == name)
+                        .map(|d| d.id.to_string())
+                })
+                .unwrap_or_else(|| name.to_string());
+            let _ = h.send(Cmd::SwitchDomain(id));
+        });
+    }
+    {
+        let h = handle.tx.clone();
+        app.on_model_select(move |name| { let _ = h.send(Cmd::UseModel(name.to_string())); });
+    }
+    {
+        let h = handle.tx.clone();
+        app.on_copy_message(move |text| { let _ = h.send(Cmd::CopyMessage(text.to_string())); });
+    }
+    // 任务看板
+    {
+        let h = handle.tx.clone();
+        app.on_task_add(move |t| { let _ = h.send(Cmd::TaskAdd(t.to_string())); });
+    }
+    {
+        let h = handle.tx.clone();
+        app.on_task_move(move |id, col| { let _ = h.send(Cmd::TaskMove { id: id.to_string(), col }); });
+    }
+    {
+        let h = handle.tx.clone();
+        app.on_task_delete(move |id| { let _ = h.send(Cmd::TaskDelete(id.to_string())); });
+    }
+    // 空间编辑 + 目录浏览
+    {
+        let h = handle.tx.clone();
+        let weak = app.as_weak();
+        app.on_space_save(move |name| {
+            let Some(a) = weak.upgrade() else { return };
+            let _ = h.send(Cmd::SpaceSave {
+                name: name.to_string(),
+                cwd: a.get_edit_cwd().to_string(),
+                authorized: a.get_edit_authorized().to_string(),
+                whitelist: a.get_edit_whitelist().to_string(),
+                approval: a.get_edit_approval().to_string(),
+                sandbox: a.get_edit_sandbox().to_string(),
+            });
+        });
+    }
+    {
+        let weak = app.as_weak();
+        app.on_pick_dir(move |key| {
+            let Some(p) = native_dialog::pick_dir("选择目录") else { return };
+            if let Some(a) = weak.upgrade() {
+                if key == "space-cwd" {
+                    a.set_edit_cwd(p.into());
+                }
+            }
+        });
+    }
+    // 会话管理
+    {
+        let h = handle.tx.clone();
+        app.on_session_list(move || { let _ = h.send(Cmd::SessionList); });
+    }
+    {
+        let h = handle.tx.clone();
+        app.on_session_open(move |id| { let _ = h.send(Cmd::SessionOpen(id.to_string())); });
+    }
+    {
+        let h = handle.tx.clone();
+        app.on_session_delete(move |id| { let _ = h.send(Cmd::SessionDelete(id.to_string())); });
+    }
+    {
+        let h = handle.tx.clone();
+        app.on_session_export(move |id| { let _ = h.send(Cmd::SessionExport(id.to_string())); });
+    }
+    {
+        let h = handle.tx.clone();
+        app.on_session_recall(move |id| { let _ = h.send(Cmd::SessionRecall(id.to_string())); });
+    }
+    // 领域 CRUD + 文件编辑
+    {
+        let h = handle.tx.clone();
+        app.on_domain_create(move |id, name| { let _ = h.send(Cmd::DomainCreate { id: id.to_string(), name: name.to_string() }); });
+    }
+    {
+        let h = handle.tx.clone();
+        app.on_domain_remove(move |id| { let _ = h.send(Cmd::DomainRemove(id.to_string())); });
+    }
+    {
+        let h = handle.tx.clone();
+        app.on_domain_file_read(move |id, file| { let _ = h.send(Cmd::DomainFileRead { id: id.to_string(), file: file.to_string() }); });
+    }
+    {
+        let h = handle.tx.clone();
+        let weak = app.as_weak();
+        app.on_domain_file_save(move |id, file, text| {
+            let text = weak.upgrade().map(|a| a.get_dom_file_text().to_string()).unwrap_or_else(|| text.to_string());
+            let _ = h.send(Cmd::DomainFileSave { id: id.to_string(), file: file.to_string(), text });
+        });
+    }
+    // 知识管理
+    {
+        let h = handle.tx.clone();
+        let weak = app.as_weak();
+        app.on_knowledge_add(move |name, text| {
+            let text = weak.upgrade().map(|a| a.get_knowledge_text().to_string()).unwrap_or_else(|| text.to_string());
+            let _ = h.send(Cmd::KnowledgeAdd { name: name.to_string(), text });
+        });
+    }
+    {
+        let h = handle.tx.clone();
+        app.on_knowledge_remove(move |name| { let _ = h.send(Cmd::KnowledgeRemove(name.to_string())); });
+    }
+    // 配置路径浏览（#13.1/#16）：UI 线程同步弹原生对话框，选到的路径走 SetField
+    {
+        let h = handle.tx.clone();
+        app.on_pick_path(move |key, is_dir| {
+            let title = format!("选择{}", if is_dir { "目录" } else { "文件" });
+            let picked = if is_dir {
+                native_dialog::pick_dir(&title)
+            } else {
+                // python/pip 选可执行文件；配置路径字段选目录
+                native_dialog::pick_file(&title, Some("可执行文件\0*.exe\0所有文件\0*.*\0\0"))
+            };
+            if let Some(path) = picked {
+                let _ = h.send(Cmd::SetFieldPath { key: key.to_string(), path });
+            }
         });
     }
     // 关窗即退出：通知引擎线程收尾后 join，保证配置落盘

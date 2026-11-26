@@ -14,7 +14,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use slint::{ModelRc, VecModel};
+use slint::{Model, ModelRc, VecModel};
 
 use agent_core::{ChatEvent, ChatSession};
 use kern_core::model::{AgentId, ExecutionContext, RiskLevel, SessionId, TaskId};
@@ -23,7 +23,7 @@ use wpa_engine::{assemble, build_session, Base, SessionInfo, SessionOpts};
 
 use crate::{
     AppWindow, CapGroupRow, CfgCard, CfgItem, ChatMsg, DayRow, DomainCardRow, DomainGroupChip,
-    RegEntryRow, RegGroupRow,
+    RegEntryRow, RegGroupRow, KnowledgeRow, SessionRow,
     ModelRow, SpaceRow, TaskRow, ToolRow, TraceRow,
 };
 
@@ -80,6 +80,40 @@ pub enum Cmd {
     /// 切换领域：写配置 + **重新装配**（领域影响 system prompt / 工具面 / 约束，
     /// 不是热参数，光重建会话不够 —— 必须重跑 assemble）。
     SwitchDomain(String),
+
+    // ---- 本轮 20 条改动新增命令 ----
+    /// #8 复制消息到剪贴板
+    CopyMessage(String),
+    /// #11 任务看板 CRUD
+    TaskAdd(String),
+    TaskMove { id: String, col: i32 },
+    TaskDelete(String),
+    /// #9 空间编辑保存（name, cwd, authorized 多行, whitelist 多行, approval 三态, sandbox 三态）
+    SpaceSave {
+        name: String,
+        cwd: String,
+        authorized: String,
+        whitelist: String,
+        approval: String,
+        sandbox: String,
+    },
+    /// #9.1 会话管理
+    SessionList,
+    SessionOpen(String),
+    SessionDelete(String),
+    SessionExport(String),
+    SessionRecall(String),
+    /// #7.1 领域 CRUD + 文件编辑
+    DomainCreate { id: String, name: String },
+    DomainRemove(String),
+    DomainFileRead { id: String, file: String },
+    DomainFileSave { id: String, file: String, text: String },
+    /// #7.2 知识管理
+    KnowledgeAdd { name: String, text: String },
+    KnowledgeRemove(String),
+    /// #13.1/#16 路径浏览：把选到的路径写入配置字段（key, path）
+    SetFieldPath { key: String, path: String },
+
     Refresh,
     Shutdown,
 }
@@ -253,6 +287,10 @@ fn build_cfg_cards(cfg: &AppConfig) -> Vec<CfgCard> {
                         | wpa_engine::FieldKind::Action { from } => {
                             from.options(cfg).into_iter().map(Into::into).collect()
                         }
+                        // Slider 用 options[0]=min、options[1]=max 传范围给 UI
+                        wpa_engine::FieldKind::Slider { min, max } => {
+                            vec![min.to_string().into(), max.to_string().into()]
+                        }
                         _ => Vec::new(),
                     };
                     CfgItem {
@@ -262,6 +300,7 @@ fn build_cfg_cards(cfg: &AppConfig) -> Vec<CfgCard> {
                         kind: match &f.kind {
                             wpa_engine::FieldKind::Bool => "bool",
                             wpa_engine::FieldKind::Int { .. } => "int",
+                            wpa_engine::FieldKind::Slider { .. } => "slider",
                             wpa_engine::FieldKind::Float { .. } => "float",
                             wpa_engine::FieldKind::Secret => "secret",
                             wpa_engine::FieldKind::Path { .. } => "path",
@@ -275,6 +314,12 @@ fn build_cfg_cards(cfg: &AppConfig) -> Vec<CfgCard> {
                         value: cfg.get_field(f.key).unwrap_or_default().into(),
                         options: ModelRc::new(VecModel::from(options)),
                         restart: !f.section.is_hot(),
+                        // 路径字段的文件/目录方向由 schema 的 Path { dir } 决定，
+                        // 不再在 UI 里写死 true（python/pip 应选 .exe 文件）。
+                        path_is_dir: match &f.kind {
+                            wpa_engine::FieldKind::Path { dir } => *dir,
+                            _ => true,
+                        },
                     }
                 })
                 .collect();
@@ -381,14 +426,22 @@ fn apply_snapshot(base: &Base, window: &slint::Weak<AppWindow>) {
             scope: s.scope as i32,
             plugins: s.plugins as i32,
             note: s.note.clone().into(),
+            cwd: s.cwd.clone().into(),
+            authorized: s.authorized.join("\n").into(),
+            whitelist: s.whitelist.join("\n").into(),
+            approval: s.approval.clone().into(),
+            sandbox: s.sandbox.clone().into(),
         })
         .collect();
     let isolated: Vec<slint::SharedString> =
         snap.isolated.iter().map(|s| s.clone().into()).collect();
-    // 知识/技能：技能按名字+触发场景列出（列表接口只有 group id，太糊）；
-    // 知识页仍按群组 id 展示（知识提供者不暴露条目数，避免误导）。
-    // 知识条目改由领域 provider 提供，快照里不再按契约群组列举
-    let knowledge: Vec<slint::SharedString> = Vec::new();
+    // 知识/技能：技能按名字+触发场景列出；知识条目由当前领域 provider 提供（#7.2）
+    let knowledge_entries: Vec<String> = {
+        let dir = base.cfg.active_domain_dir();
+        let provider = knowledge_core::FileKnowledgeProvider::from_dir("domain", &dir, &[], None);
+        provider.list_entries()
+    };
+    let knowledge: Vec<slint::SharedString> = knowledge_entries.iter().map(|s| s.clone().into()).collect();
     let skills: Vec<slint::SharedString> = snap
         .skills
         .iter()
@@ -421,6 +474,7 @@ fn apply_snapshot(base: &Base, window: &slint::Weak<AppWindow>) {
         .filter_map(|r| {
             let col = r.board_col(&pairs)?;
             Some(TaskRow {
+                id: r.id.to_string().into(),
                 title: r.subject.clone().into(),
                 status: match col {
                     0 => "待规划",
@@ -460,6 +514,12 @@ fn apply_snapshot(base: &Base, window: &slint::Weak<AppWindow>) {
     // 卡片模型含 ModelRc（单线程类型），只能在 UI 线程内构建 ⇒ 把配置快照搬进闭包
     let cfg_for_cards = base.cfg.clone();
     let domain_name = snap.domain.clone();
+    let model_names: Vec<slint::SharedString> = base
+        .models()
+        .iter()
+        .map(|m| m.name.clone().into())
+        .collect();
+    let degraded = snap.warnings.iter().any(|w| w.contains("降级"));
     ui_set(window, move |app| {
         app.set_tools(ModelRc::new(VecModel::from(tools)));
         // 领域行含 ModelRc（!Send），只能在 UI 线程里构建
@@ -500,13 +560,17 @@ fn apply_snapshot(base: &Base, window: &slint::Weak<AppWindow>) {
         app.set_cap_groups(ModelRc::new(VecModel::from(cap_groups)));
 
         // 注册表视图（含插件与未安装条目）
+        // #3：内置基础组（内核/沙箱/命令与作业/工作空间/记忆检索）不参与插件工具管理，
+        // 从能力页左栏隐藏；file/net/text 及插件/未分配组仍保留。
         let reg_groups: Vec<RegGroupRow> = snap
             .reg_groups
             .iter()
+            .filter(|g| wpa_engine::snapshot::is_managed_group(&g.id))
             .map(|g| RegGroupRow {
                 id: g.id.clone().into(),
                 label: g.label.clone().into(),
                 source: g.source.clone().into(),
+                description: g.description.clone().into(),
                 enabled: g.enabled,
                 total: g.total as i32,
                 active: g.active as i32,
@@ -517,6 +581,7 @@ fn apply_snapshot(base: &Base, window: &slint::Weak<AppWindow>) {
         let reg_entries: Vec<RegEntryRow> = snap
             .reg_entries
             .iter()
+            .filter(|e| wpa_engine::snapshot::is_managed_group(&e.group))
             .map(|e| RegEntryRow {
                 id: e.id.clone().into(),
                 group: e.group.clone().into(),
@@ -535,10 +600,35 @@ fn apply_snapshot(base: &Base, window: &slint::Weak<AppWindow>) {
         app.set_reg_summary(snap.reg_summary.as_str().into());
         app.set_spaces(ModelRc::new(VecModel::from(spaces)));
         app.set_models(ModelRc::new(VecModel::from(models)));
+        // 任务看板四列：把同一份任务按 col 拆成四份下发（Slint 侧不做过滤）
+        let col0: Vec<TaskRow> = tasks.iter().filter(|t| t.col == 0).cloned().collect();
+        let col1: Vec<TaskRow> = tasks.iter().filter(|t| t.col == 1).cloned().collect();
+        let col2: Vec<TaskRow> = tasks.iter().filter(|t| t.col == 2).cloned().collect();
+        let col3: Vec<TaskRow> = tasks.iter().filter(|t| t.col == 3).cloned().collect();
         app.set_tasks(ModelRc::new(VecModel::from(tasks)));
+        app.set_col0(ModelRc::new(VecModel::from(col0)));
+        app.set_col1(ModelRc::new(VecModel::from(col1)));
+        app.set_col2(ModelRc::new(VecModel::from(col2)));
+        app.set_col3(ModelRc::new(VecModel::from(col3)));
+        // 对话页选择器候选（空间名 / 领域名 / 模型名）
+        // 注意：闭包是 'static，不能捕获 base 引用——模型名在闭包外用 owned 值算好
+        app.set_space_options(ModelRc::new(VecModel::from(
+            snap.spaces.iter().map(|s| s.name.clone().into()).collect::<Vec<slint::SharedString>>(),
+        )));
+        app.set_domain_options(ModelRc::new(VecModel::from(
+            snap.domains.iter().map(|d| d.name.clone().into()).collect::<Vec<slint::SharedString>>(),
+        )));
+        app.set_model_options(ModelRc::new(VecModel::from(model_names.clone())));
+        app.set_degraded(degraded);
         app.set_memory_days(ModelRc::new(VecModel::from(days)));
         app.set_isolated(ModelRc::new(VecModel::from(isolated)));
         app.set_knowledge_names(ModelRc::new(VecModel::from(knowledge)));
+        app.set_knowledge(ModelRc::new(VecModel::from(
+            knowledge_entries
+                .iter()
+                .map(|n| KnowledgeRow { name: n.clone().into(), excerpt: "".into() })
+                .collect::<Vec<_>>(),
+        )));
         app.set_skill_names(ModelRc::new(VecModel::from(skills)));
         app.set_tool_count(tool_count);
         app.set_c0(counts.planned as i32);
@@ -582,6 +672,35 @@ struct Engine {
     /// 本进程累计用量（状态条展示；空间级持久记账另有 record_usage）
     tokens_in: u64,
     tokens_out: u64,
+    /// 会话列表的空间过滤器（点空间"编辑"时设置）
+    session_filter: String,
+}
+
+/// 毫秒时间戳 → 本地时间字符串（会话列表用）。
+fn format_time(ms: u64) -> String {
+    if ms == 0 {
+        return "-".to_string();
+    }
+    let secs = (ms / 1000) as i64;
+    // 用标准库把 UTC 秒转成日期时间，避免引入 chrono 依赖
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02} {:02}:{:02}", rem / 3600, (rem % 3600) / 60)
+}
+
+/// _days since 1970-01-01 → (year, month, day)，Howard Hinnant 的算法（无依赖）。
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (y + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
 fn run_engine(
@@ -633,6 +752,7 @@ fn run_engine(
         info: None,
         ui: UiData::new(),
         approval,
+        session_filter: String::new(),
     };
 
     apply_snapshot(&engine.base, &window);
@@ -683,15 +803,41 @@ impl Engine {
         let model = if info.model.is_empty() { "未配置模型".to_string() } else { info.model.clone() };
         let space = if info.space.is_empty() { "全局".to_string() } else { info.space.clone() };
         let ctx = info.context_window as i32;
-        let warnings = info.warnings.join(" · ");
+        // #1 决策：降级只在对话框顶部条显示"降级"标记，不再用 toast 弹整段警告
+        // （那正是"点预设/改输入框就弹警告"的观感来源）。其余诊断仍留在状态栏。
+        let degraded = info.warnings.iter().any(|w| w.contains("降级"));
         ui_set(&self.window, move |app| {
             app.set_model_name(model.into());
             app.set_space_name(space.into());
             app.set_ctx_window(ctx);
-            if !warnings.is_empty() {
-                app.set_toast_text(warnings.into());
-                app.set_toast_open(true);
-            }
+            app.set_degraded(degraded);
+        });
+    }
+
+    /// #4 回填能力页选中条目的详情（安装/卸载后也要立即刷新，不能等重新点选）
+    fn push_ab_detail(&self, id: &str) {
+        let snap = self.base.snapshot();
+        let hit = snap.reg_entries.iter().find(|e| e.id == id).cloned();
+        let (name, group, source, risk, status, note, installed, enabled) = match hit {
+            Some(e) => (
+                e.name, e.group, e.source, e.risk, e.status, e.note, e.installed, e.enabled,
+            ),
+            None => (
+                String::new(), String::new(), String::new(), String::new(),
+                String::new(), String::new(), false, false,
+            ),
+        };
+        let id = id.to_string();
+        ui_set(&self.window, move |app| {
+            app.set_ab_id(id.into());
+            app.set_ab_name(name.into());
+            app.set_ab_group(group.into());
+            app.set_ab_source(source.into());
+            app.set_ab_risk(risk.into());
+            app.set_ab_status(status.into());
+            app.set_ab_note(note.into());
+            app.set_ab_installed(installed);
+            app.set_ab_enabled(enabled);
         });
     }
 
@@ -742,7 +888,13 @@ impl Engine {
         // 审批回调：同步阻塞等 UI 裁决
         let ap_slot = self.approval.clone();
         let ap_window = window.clone();
-        let auto = self.cfg.run.auto_approve;
+        // 空间级审批覆盖（#14）：空间设了 auto_approve 就盖掉全局，否则跟随全局
+        let auto = self
+            .base
+            .workspaces
+            .active()
+            .map(|w| w.approval(self.cfg.run.auto_approve))
+            .unwrap_or(self.cfg.run.auto_approve);
         let timeout = self.cfg.run.approval_timeout_secs.unwrap_or(300);
         let approval: agent_core::ApprovalCallback =
             Arc::new(move |tool: &str, risk: RiskLevel, args: &str| -> bool {
@@ -779,7 +931,12 @@ impl Engine {
             targets: Vec::new(),
             approval,
             events: Some(events),
-            auto_approve: self.cfg.run.auto_approve,
+            auto_approve: self
+                .base
+                .workspaces
+                .active()
+                .map(|w| w.approval(self.cfg.run.auto_approve))
+                .unwrap_or(self.cfg.run.auto_approve),
         };
         let (session, info) = build_session(&self.base, opts);
         self.session = Some(session);
@@ -1157,13 +1314,17 @@ impl Engine {
             Cmd::SetField { key, value } => {
                 let old_theme = self.cfg.app.theme.clone();
                 let old_font = self.cfg.app.font_size;
+                let old_value = self.cfg.get_field(&key).unwrap_or_default();
                 if let Err(e) = self.cfg.set_field(&key, &value) {
                     toast(&self.window, format!("{key} 写入失败：{e}"));
                     return;
                 }
-                // 校验不通过就不落盘（把校验消息原样给出，而不是"保存成功"）
-                let errs = self.cfg.validate();
+                // #12 局部校验：只校验当前正在改的字段，不再因整表别处的错误
+                // 卡住这一次输入（那会让"改任意输入框"都弹出无关警告）。
+                let errs = self.cfg.validate_field(&key);
                 if !errs.is_empty() {
+                    // 回滚这一次写入，避免非法值留在内存里
+                    let _ = self.cfg.set_field(&key, &old_value);
                     toast(&self.window, format!("未保存：{}", errs.join("；")));
                     return;
                 }
@@ -1269,32 +1430,53 @@ impl Engine {
                     }
                 }
             }
-            Cmd::PickTool(id) => {
-                let snap = self.base.snapshot();
-                let hit = snap.reg_entries.iter().find(|e| e.id == id).cloned();
-                let (name, group, source, risk, status, note, installed, enabled) = match hit {
-                    Some(e) => (
-                        e.name, e.group, e.source, e.risk, e.status, e.note, e.installed, e.enabled,
-                    ),
-                    None => (
-                        String::new(), String::new(), String::new(), String::new(),
-                        String::new(), String::new(), false, false,
-                    ),
-                };
-                ui_set(&self.window, move |app| {
-                    app.set_ab_id(id.into());
-                    app.set_ab_name(name.into());
-                    app.set_ab_group(group.into());
-                    app.set_ab_source(source.into());
-                    app.set_ab_risk(risk.into());
-                    app.set_ab_status(status.into());
-                    app.set_ab_note(note.into());
-                    app.set_ab_installed(installed);
-                    app.set_ab_enabled(enabled);
-                });
-            }
+            Cmd::PickTool(id) => self.push_ab_detail(&id),
             Cmd::RegOp { id, op } => {
-                // "move:<组id>" = 组↔条目绑定（换归属不动开关）
+                // #5/#6 组管理 + 分配：这些 op 只改注册表，不改工具装配语义
+                let group_op: Option<String> = if let Some(name) = op.strip_prefix("group-add:") {
+                    Some(format!("新建组 {name}"))
+                } else if let Some(name) = op.strip_prefix("group-rename:") {
+                    Some(format!("组改名为 {name}"))
+                } else if op == "group-remove" {
+                    Some("删除组（条目移到未分配）".into())
+                } else if let Some(desc) = op.strip_prefix("group-desc:") {
+                    Some(format!("组描述：{desc}"))
+                } else if let Some(group) = op.strip_prefix("assign:") {
+                    Some(format!("分配到组 {group}"))
+                } else {
+                    None
+                };
+                if group_op.is_some() {
+                    let path = wpa_engine::registry::registry_path(&self.base.cfg.data_root());
+                    let mut reg = self.base.registry.write().unwrap_or_else(|e| e.into_inner());
+                    let (scanned, _) = wpa_engine::registry::scan_plugins(&self.base.cfg.plugins_root());
+                    reg.merge_scan(&scanned);
+                    let result: Result<(), String> = if let Some(name) = op.strip_prefix("group-add:") {
+                        reg.add_group(name.trim(), name.trim(), "")
+                    } else if let Some(name) = op.strip_prefix("group-rename:") {
+                        reg.rename_group(&id, name.trim())
+                    } else if op == "group-remove" {
+                        reg.remove_group(&id).map(|_| ())
+                    } else if let Some(desc) = op.strip_prefix("group-desc:") {
+                        reg.set_group_description(&id, desc)
+                    } else if let Some(group) = op.strip_prefix("assign:") {
+                        reg.assign_entry(&id, group)
+                    } else {
+                        unreachable!()
+                    };
+                    let msg = match result {
+                        Ok(()) => match reg.save(&path) {
+                            Ok(()) => format!("{}：成功（已保存）", group_op.unwrap()),
+                            Err(e) => format!("保存失败：{e}"),
+                        },
+                        Err(e) => e,
+                    };
+                    drop(reg);
+                    self.reload_tree();
+                    toast(&self.window, msg);
+                    return;
+                }
+                // move:<组id> = 组↔条目绑定（换归属不动开关）
                 if let Some(to_group) = op.strip_prefix("move:") {
                     let path = wpa_engine::registry::registry_path(&self.base.cfg.data_root());
                     let mut reg = match self.base.registry.write() {
@@ -1332,24 +1514,20 @@ impl Engine {
                             let n = reg.install_group(&id);
                             format!("组 {id} 已安装：{n} 个条目")
                         }
-                        ("install", false) => {
-                            if reg.set_entry_enabled(&id, true) {
-                                format!("条目 {id} 已启用")
-                            } else {
-                                format!("条目 {id} 状态未变化")
-                            }
-                        }
+                        // #4 单条安装/卸载：走完整状态机（installed + status），
+                        // 不再只改 enabled——那正是"点安装没变化/卸载显示禁用"的根因。
+                        ("install", false) => match reg.install_entry(&id) {
+                            Ok(()) => format!("条目 {id} 已安装"),
+                            Err(e) => e,
+                        },
                         ("uninstall", true) => {
                             let n = reg.uninstall_group(&id);
                             format!("组 {id} 已卸载：{n} 个条目转为候选")
                         }
-                        ("uninstall", false) => {
-                            if reg.set_entry_enabled(&id, false) {
-                                format!("条目 {id} 已卸载（记录保留）")
-                            } else {
-                                format!("条目 {id} 状态未变化")
-                            }
-                        }
+                        ("uninstall", false) => match reg.uninstall_entry(&id) {
+                            Ok(()) => format!("条目 {id} 已卸载（未安装）"),
+                            Err(e) => e,
+                        },
                         ("enable", _) => {
                             if reg.set_entry_enabled(&id, true) {
                                 format!("条目 {id} 已启用")
@@ -1386,6 +1564,8 @@ impl Engine {
                     }
                 };
                 self.reload_tree();
+                // #4 操作后立即回填详情，按钮状态跟着变（不必等用户重新点选条目）
+                self.push_ab_detail(&id);
                 toast(&self.window, msg);
             }
             Cmd::DomainPick(i) => {
@@ -1426,6 +1606,227 @@ impl Engine {
                     Err(e) => toast(&self.window, format!("保存失败：{e}")),
                 }
             }
+            // #8 复制消息：写系统剪贴板（Windows 下用 Win32，见 clipboard 模块）
+            Cmd::CopyMessage(text) => {
+                match crate::clipboard::copy(&text) {
+                    Ok(()) => toast(&self.window, "已复制到剪贴板"),
+                    Err(e) => toast(&self.window, format!("复制失败：{e}")),
+                }
+            }
+
+            // #11 任务看板 CRUD
+            Cmd::TaskAdd(title) => {
+                let title = title.trim().to_string();
+                if title.is_empty() {
+                    return;
+                }
+                match self.base.tasks.create(&title, "", "", "", vec![]) {
+                    Ok(id) => {
+                        toast(&self.window, format!("已添加任务 #{id}"));
+                        apply_snapshot(&self.base, &self.window);
+                    }
+                    Err(e) => toast(&self.window, format!("添加失败：{e}")),
+                }
+            }
+            Cmd::TaskMove { id, col } => {
+                match id.parse::<u64>().ok().and_then(|n| self.base.tasks.get(n)) {
+                    Some(mut rec) => {
+                        rec.status = match col {
+                            0 => 0,       // 待规划 = pending
+                            1 => 1,       // 待办
+                            2 => 2,       // 进行中
+                            _ => 3,       // 已完成（TaskStore 用 3 = done）
+                        };
+                        match self.base.tasks.update(&mut rec) {
+                            Ok(()) => apply_snapshot(&self.base, &self.window),
+                            Err(e) => toast(&self.window, format!("移动失败：{e}")),
+                        }
+                    }
+                    None => toast(&self.window, format!("任务 {id} 不存在")),
+                }
+            }
+            Cmd::TaskDelete(id) => {
+                match id.parse::<u64>().map(|n| self.base.tasks.delete(n)) {
+                    Ok(Ok(true)) => apply_snapshot(&self.base, &self.window),
+                    Ok(Ok(false)) => toast(&self.window, "任务不存在"),
+                    Ok(Err(e)) => toast(&self.window, format!("删除失败：{e}")),
+                    Err(_) => toast(&self.window, format!("非法任务 id：{id}")),
+                }
+            }
+
+            // #9 空间编辑保存
+            Cmd::SpaceSave { name, cwd, authorized, whitelist, approval, sandbox } => {
+                let Some(mut w) = self.base.workspaces.get(&name) else {
+                    toast(&self.window, format!("空间 {name} 不存在"));
+                    return;
+                };
+                w.cwd = cwd.trim().to_string();
+                w.scope = authorized.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+                w.plugins = whitelist.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+                w.auto_approve = match approval.as_str() {
+                    "auto" => Some(true), "ask" => Some(false), _ => None,
+                };
+                w.restricted_token = match sandbox.as_str() {
+                    "strict" => Some(true), "relaxed" => Some(false), _ => None,
+                };
+                match self.base.workspaces.update(w) {
+                    Ok(()) => {
+                        // 空间级策略改了要重建会话（授权/审批在会话构建时生效）
+                        self.session = None;
+                        self.ensure_session();
+                        apply_snapshot(&self.base, &self.window);
+                        toast(&self.window, format!("空间 {name} 已保存"));
+                    }
+                    Err(e) => toast(&self.window, format!("保存失败：{e}")),
+                }
+            }
+
+            // #9.1 会话管理
+            Cmd::SessionList => {
+                let Some(store) = self.base.sessions.as_ref() else {
+                    toast(&self.window, "会话库不可用");
+                    return;
+                };
+                let filter = self.session_filter.clone();
+                let rows: Vec<SessionRow> = store
+                    .list_by_workspace(&filter)
+                    .into_iter()
+                    .map(|r| {
+                        let preview = if r.title.is_empty() {
+                            store
+                                .recall_preview(&r.id, 1)
+                                .ok()
+                                .and_then(|v| v.first().cloned())
+                                .unwrap_or_default()
+                        } else {
+                            r.title.clone()
+                        };
+                        SessionRow {
+                            id: r.id.clone().into(),
+                            preview: preview.into(),
+                            turns: r.turns as i32,
+                            updated: format_time(r.updated_ms).into(),
+                            space: r.workspace.into(),
+                        }
+                    })
+                    .collect();
+                ui_set(&self.window, move |app| {
+                    app.set_sessions(ModelRc::new(VecModel::from(rows)));
+                });
+            }
+            Cmd::SessionOpen(id) | Cmd::SessionRecall(id) => {
+                let Some(store) = self.base.sessions.as_ref() else { return };
+                match store.recall_preview(&id, 8) {
+                    Ok(lines) => {
+                        let text = lines.join("\n");
+                        // 召回内容注入到对话框：作为一条 system 消息展示，模型下一轮可见
+                        push_msg(&self.window, &self.ui.messages, "assistant", format!("【会话 {id} 召回】\n{text}"));
+                        toast(&self.window, format!("已召回会话 {id} 的最近 {} 条", lines.len()));
+                    }
+                    Err(e) => toast(&self.window, format!("召回失败：{e}")),
+                }
+            }
+            Cmd::SessionDelete(id) => {
+                let Some(store) = self.base.sessions.as_ref() else { return };
+                let removed_id = id.clone();
+                match store.delete(&id) {
+                    Ok(true) => {
+                        toast(&self.window, "会话已删除");
+                        ui_set(&self.window, move |app| {
+                            let model = app.get_sessions();
+                            let cur: Vec<SessionRow> = (0..model.row_count())
+                                .filter_map(|i| model.row_data(i))
+                                .filter(|s| s.id != removed_id.as_str())
+                                .collect();
+                            app.set_sessions(ModelRc::new(VecModel::from(cur)));
+                        });
+                    }
+                    Ok(false) => toast(&self.window, "会话不存在"),
+                    Err(e) => toast(&self.window, format!("删除失败：{e}")),
+                }
+            }
+            Cmd::SessionExport(id) => {
+                let Some(store) = self.base.sessions.as_ref() else { return };
+                let dir = self.base.cfg.data_root().join("exports");
+                let path = dir.join(format!("{id}.jsonl"));
+                match store.export_jsonl(&id, &path) {
+                    Ok(()) => toast(&self.window, format!("已导出：{}", path.display())),
+                    Err(e) => toast(&self.window, format!("导出失败：{e}")),
+                }
+            }
+
+            // #7.1 领域 CRUD + 文件编辑
+            Cmd::DomainCreate { id, name } => {
+                let root = self.base.cfg.domains_root();
+                let display = if name.trim().is_empty() { id.clone() } else { name.clone() };
+                match wpa_engine::domain::create_domain(&root, &id, &display) {
+                    Ok(()) => {
+                        self.reload_tree();
+                        toast(&self.window, format!("领域 {id} 已创建"));
+                    }
+                    Err(e) => toast(&self.window, format!("创建失败：{e}")),
+                }
+            }
+            Cmd::DomainRemove(id) => {
+                let root = self.base.cfg.domains_root();
+                match wpa_engine::domain::remove_domain(&root, &id) {
+                    Ok(()) => {
+                        if self.cfg.domain.active == id {
+                            self.cfg.domain.active.clear();
+                            let _ = self.cfg.commit(&self.cfg_path, &[ConfigSection::Domain]);
+                        }
+                        self.reload_tree();
+                        toast(&self.window, format!("领域 {id} 已删除"));
+                    }
+                    Err(e) => toast(&self.window, format!("删除失败：{e}")),
+                }
+            }
+            Cmd::DomainFileRead { id, file } => {
+                let root = self.base.cfg.domains_root();
+                match wpa_engine::domain::read_domain_file(&root, &id, &file) {
+                    Ok(text) => ui_set(&self.window, move |app| {
+                        app.set_dom_file_text(text.into());
+                    }),
+                    Err(e) => toast(&self.window, format!("读取失败：{e}")),
+                }
+            }
+            Cmd::DomainFileSave { id, file, text } => {
+                let root = self.base.cfg.domains_root();
+                match wpa_engine::domain::write_domain_file(&root, &id, &file, &text) {
+                    Ok(()) => toast(&self.window, format!("已保存 {file}")),
+                    Err(e) => toast(&self.window, format!("保存失败：{e}")),
+                }
+            }
+
+            // #7.2 知识管理
+            Cmd::KnowledgeAdd { name, text } => {
+                let dir = self.base.cfg.active_domain_dir();
+                let provider = knowledge_core::FileKnowledgeProvider::from_dir("domain", &dir, &[], None);
+                match provider.add_entry(&name, &text) {
+                    Ok(()) => {
+                        self.reload_tree();
+                        toast(&self.window, format!("知识 {name} 已添加"));
+                    }
+                    Err(e) => toast(&self.window, format!("添加失败：{e}")),
+                }
+            }
+            Cmd::KnowledgeRemove(name) => {
+                let dir = self.base.cfg.active_domain_dir();
+                let provider = knowledge_core::FileKnowledgeProvider::from_dir("domain", &dir, &[], None);
+                match provider.remove_entry(&name) {
+                    Ok(()) => {
+                        self.reload_tree();
+                        toast(&self.window, format!("知识 {name} 已删除"));
+                    }
+                    Err(e) => toast(&self.window, format!("删除失败：{e}")),
+                }
+            }
+
+            // #13.1/#16 路径浏览结果：复用 SetField 的校验/落盘链路
+            Cmd::SetFieldPath { key, path } => {
+                self.handle(Cmd::SetField { key, value: path });
+            }
+
             Cmd::Refresh => {
                 apply_snapshot(&self.base, &self.window);
                 toast(&self.window, "已刷新");

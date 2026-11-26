@@ -1,7 +1,8 @@
 //! Python 运行沙箱插件（sandbox.python + python-sandbox 组件）。
 //!
 //! - 解释器：exe 同级 `python/python.exe`（兼容用户预置的 `python-3.15-embed/python.exe`），
-//!   不接受任意 command（防绕过）；
+//!   不接受任意 command（防绕过）；配置装配可通过 `WPA_PYTHON_PATH` / `WPA_PIP_PATH`
+//!   指定有效文件覆盖，无效值回退自动探测；
 //! - 脚本：固定 exe 同级 `scripts/`，拒绝 `..`、绝对路径、盘符；
 //! - argv 直传不经 shell；cwd=scripts；超时 + 输出截断 + 审计日志；
 //! - 一切皆插件：Tool 供 LLM 调用；Component 供插件清单登记。
@@ -50,14 +51,68 @@ pub fn app_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// 定位 Python 解释器：优先 python/python.exe，兼容 python-3.15-embed/python.exe。
-pub fn find_interpreter(root: &Path) -> Option<PathBuf> {
+/// 读取环境变量覆盖：仅用 std::env::var_os（不引入依赖）；空白视为未设置。
+fn env_override(key: &str) -> Option<String> {
+    std::env::var_os(key)
+        .and_then(|v| v.into_string().ok())
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// 环境变量指向的有效文件覆盖（路径不存在或不是文件则忽略）。
+fn env_file_override(key: &str) -> Option<PathBuf> {
+    env_override(key).map(PathBuf::from).filter(|p| p.is_file())
+}
+
+/// 定位 Python 解释器：override 非空且指向有效文件时优先用它，否则回退随包候选。
+///
+/// override 来源是配置装配时写入的环境变量 `WPA_PYTHON_PATH`；无效值不静默换成别的
+/// 可执行文件，而是退回原来的自动探测行为。
+pub fn find_interpreter_with_override(root: &Path, override_path: Option<&str>) -> Option<PathBuf> {
+    if let Some(p) = override_path {
+        let p = p.trim();
+        if !p.is_empty() {
+            let candidate = PathBuf::from(p);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
     let candidates = [
         root.join("python").join("python.exe"),
         root.join("python-3.15-embed").join("python.exe"),
         root.join("python").join("python3.exe"),
     ];
     candidates.into_iter().find(|p| p.is_file())
+}
+
+/// 兼容旧调用点：不带覆盖，走原有候选探测。
+pub fn find_interpreter(root: &Path) -> Option<PathBuf> {
+    find_interpreter_with_override(root, None)
+}
+
+/// 组装 pip 调用：有 pip 覆盖时直接执行它（不带 `-m pip`），否则 `python -m pip`。
+fn pip_command(
+    interp: &str,
+    pip_override: Option<&str>,
+    upgrade: bool,
+    packages: &[String],
+    site: &Path,
+) -> (String, Vec<String>) {
+    let mut args: Vec<String> = vec![
+        "install".into(),
+        "--target".into(),
+        site.to_string_lossy().into_owned(),
+    ];
+    if upgrade {
+        args.push("--upgrade".into());
+    }
+    args.extend(packages.iter().cloned());
+    let program = pip_override.unwrap_or(interp).to_string();
+    if pip_override.is_none() {
+        args.insert(0, "pip".into());
+        args.insert(0, "-m".into());
+    }
+    (program, args)
 }
 
 /// 脚本根（exe 同级 scripts/）。
@@ -103,7 +158,11 @@ pub async fn run_script(
     timeout_ms: u64,
 ) -> Result<PyRunResult, PySandboxError> {
     let root = app_root();
-    let interp = find_interpreter(&root).ok_or(PySandboxError::InterpreterMissing)?;
+    let interp = find_interpreter_with_override(
+        &root,
+        env_override("WPA_PYTHON_PATH").as_deref(),
+    )
+    .ok_or(PySandboxError::InterpreterMissing)?;
     let script_path = resolve_script(&root, script)?;
     let timeout = timeout_ms.clamp(1000, MAX_TIMEOUT_MS);
     let scripts = scripts_root(&root);
@@ -183,7 +242,11 @@ pub async fn run_script_restricted(
     timeout_ms: u64,
 ) -> Result<PyRunResult, PySandboxError> {
     let root = app_root();
-    let interp = find_interpreter(&root).ok_or(PySandboxError::InterpreterMissing)?;
+    let interp = find_interpreter_with_override(
+        &root,
+        env_override("WPA_PYTHON_PATH").as_deref(),
+    )
+    .ok_or(PySandboxError::InterpreterMissing)?;
     let script_path = resolve_script(&root, script)?;
     let timeout = timeout_ms.clamp(1000, MAX_TIMEOUT_MS);
     let scripts = scripts_root(&root);
@@ -395,10 +458,15 @@ sandbox.python 的 PYTHONPATH 已包含 site-packages/，安装完成即可 impo
         let upgrade = args.get("upgrade").and_then(Value::as_bool).unwrap_or(false);
 
         let root = app_root();
-        let Some(interp) = find_interpreter(&root) else {
+        let Some(interp) = find_interpreter_with_override(
+            &root,
+            env_override("WPA_PYTHON_PATH").as_deref(),
+        ) else {
             return ToolResult::error("Python 解释器未找到（检查 exe 同级 python/）", ms());
         };
         let interp = interp.to_string_lossy().into_owned();
+        let pip_override = env_file_override("WPA_PIP_PATH")
+            .map(|p| p.to_string_lossy().into_owned());
         let site = root.join("site-packages");
 
         // 沙箱统一执行：限时 + decode_output 截断 + 审计
@@ -407,23 +475,25 @@ sandbox.python 的 PYTHONPATH 已包含 site-packages/，安装完成即可 impo
             ..SandboxConfig::default()
         });
 
-        // ensurepip 幂等自举（失败仅记录继续——多数随包解释器已带 pip）
-        match sandbox.exec(ctx, &interp, &["-m", "ensurepip"]).await {
-            Ok(o) => tracing::info!(exit = ?o.exit_code, "sandbox.pip ensurepip"),
-            Err(e) => tracing::warn!(error = %e, "ensurepip 失败（继续尝试 pip install）"),
+        // ensurepip 幂等自举（失败仅记录继续——多数随包解释器已带 pip）。
+        // 已有 pip 覆盖时无需自举。
+        if pip_override.is_none() {
+            match sandbox.exec(ctx, &interp, &["-m", "ensurepip"]).await {
+                Ok(o) => tracing::info!(exit = ?o.exit_code, "sandbox.pip ensurepip"),
+                Err(e) => tracing::warn!(error = %e, "ensurepip 失败（继续尝试 pip install）"),
+            }
         }
 
-        let mut install_args: Vec<String> = vec![
-            "-m".into(), "pip".into(), "install".into(),
-            "--target".into(), site.to_string_lossy().into_owned(),
-        ];
-        if upgrade {
-            install_args.push("--upgrade".into());
-        }
-        install_args.extend(packages.iter().cloned());
+        let (program, install_args) = pip_command(
+            &interp,
+            pip_override.as_deref(),
+            upgrade,
+            &packages,
+            &site,
+        );
         let argrefs: Vec<&str> = install_args.iter().map(String::as_str).collect();
 
-        match sandbox.exec(ctx, &interp, &argrefs).await {
+        match sandbox.exec(ctx, &program, &argrefs).await {
             Ok(out) => {
                 let summary = format!(
                     "pip install {} → exit {:?}（{}ms，stdout {}B）",
@@ -462,6 +532,109 @@ mod tests {
         let _ = std::fs::remove_file(&fake);
         assert!(find_interpreter(&tmp).is_none());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn find_interpreter_with_override_prefers_valid_file() {
+        let tmp = std::env::temp_dir().join(format!("wpa_py_override_{}", std::process::id()));
+        let bundled = tmp.join("python");
+        let custom_dir = tmp.join("custom");
+        let _ = std::fs::create_dir_all(&bundled);
+        let _ = std::fs::create_dir_all(&custom_dir);
+        let bundled_exe = bundled.join("python.exe");
+        let custom_exe = custom_dir.join("my-python.exe");
+        let _ = std::fs::write(&bundled_exe, b"bundled");
+        let _ = std::fs::write(&custom_exe, b"custom");
+
+        // 有效 override 直接胜出（即便随包候选也在）
+        let custom_s = custom_exe.to_string_lossy().into_owned();
+        assert_eq!(
+            find_interpreter_with_override(&tmp, Some(&custom_s)),
+            Some(custom_exe.clone())
+        );
+        // 无效 override（不存在 / 是目录 / 空白）回退原候选
+        let bads = vec![
+            custom_dir.join("missing.exe").to_string_lossy().into_owned(),
+            tmp.to_string_lossy().into_owned(),
+            String::new(),
+            "   ".into(),
+        ];
+        for bad in &bads {
+            assert_eq!(
+                find_interpreter_with_override(&tmp, Some(bad.as_str())),
+                Some(bundled_exe.clone()),
+                "bad override = {bad:?}"
+            );
+        }
+        // None 保持兼容旧行为
+        assert_eq!(find_interpreter_with_override(&tmp, None), Some(bundled_exe.clone()));
+        assert_eq!(find_interpreter(&tmp), Some(bundled_exe));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn env_override_reads_value_and_ignores_blank() {
+        const KEY: &str = "WPA_TEST_PY_OVERRIDE";
+        std::env::set_var(KEY, "C:/tools/python.exe");
+        assert_eq!(env_override(KEY).as_deref(), Some("C:/tools/python.exe"));
+        std::env::set_var(KEY, "   ");
+        assert!(env_override(KEY).is_none(), "空白视为未设置");
+        std::env::remove_var(KEY);
+        assert!(env_override(KEY).is_none());
+    }
+
+    #[test]
+    fn python_path_env_override_is_wired() {
+        let tmp = std::env::temp_dir().join(format!("wpa_py_env_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(tmp.join("python"));
+        let bundled = tmp.join("python").join("python.exe");
+        let custom = tmp.join("custom-python.exe");
+        let _ = std::fs::write(&bundled, b"bundled");
+        let _ = std::fs::write(&custom, b"custom");
+
+        let prev = std::env::var_os("WPA_PYTHON_PATH");
+        std::env::set_var("WPA_PYTHON_PATH", &custom);
+        let got = find_interpreter_with_override(
+            &tmp,
+            env_override("WPA_PYTHON_PATH").as_deref(),
+        );
+        // 立刻恢复，避免污染同进程其他测试
+        match prev {
+            Some(v) => std::env::set_var("WPA_PYTHON_PATH", v),
+            None => std::env::remove_var("WPA_PYTHON_PATH"),
+        }
+        assert_eq!(got, Some(custom));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn pip_command_uses_override_without_m_pip() {
+        let site = PathBuf::from("C:/app/site-packages");
+        let pkgs = vec!["requests".to_string(), "pycryptodome".to_string()];
+        let (prog, args) = pip_command("C:/app/python/python.exe", None, false, &pkgs, &site);
+        assert_eq!(prog, "C:/app/python/python.exe");
+        let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert_eq!(
+            argrefs,
+            vec!["-m", "pip", "install", "--target", "C:/app/site-packages",
+                 "requests", "pycryptodome"]
+        );
+
+        let (prog, args) = pip_command(
+            "C:/app/python/python.exe",
+            Some("C:/app/Scripts/pip.exe"),
+            true,
+            &pkgs,
+            &site,
+        );
+        assert_eq!(prog, "C:/app/Scripts/pip.exe");
+        let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert_eq!(
+            argrefs,
+            vec!["install", "--target", "C:/app/site-packages", "--upgrade",
+                 "requests", "pycryptodome"]
+        );
+        assert!(!argrefs.iter().any(|a| *a == "-m" || *a == "pip"));
     }
 
     #[test]

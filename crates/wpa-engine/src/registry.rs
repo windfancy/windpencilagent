@@ -30,6 +30,12 @@ use crate::catalog::{self, BuiltinSpec};
 /// 注册表格式版本。加字段不升版（`serde(default)` 兜底）；语义变更才升。
 pub const REGISTRY_VERSION: u32 = 1;
 
+/// 「未分配」组 id：存放所有不属于任何用户组的条目（移出组、卸载后的落点）。
+///
+/// 这是保留组：不能新建、改名、删除，也不能直接安装其中的条目——
+/// 必须先由用户分配到具体组。它始终存在，且固定在列表末尾。
+pub const UNASSIGNED_GROUP: &str = "__unassigned__";
+
 /// 条目状态。
 pub mod status {
     /// 清单与文件都在，已安装，可用。
@@ -69,6 +75,8 @@ impl Default for ToolRegistry {
 pub struct GroupRecord {
     pub id: String,
     pub name: String,
+    /// 用户可编辑的组描述（管理 UI 的副标题）。
+    pub description: String,
     /// tools / knowledge / logic / skills
     pub kind: String,
     /// builtin / plugin / declarative
@@ -181,6 +189,7 @@ impl ToolRegistry {
             .map(|g| GroupRecord {
                 id: g.id.to_string(),
                 name: g.label.to_string(),
+                description: String::new(),
                 kind: "tools".to_string(),
                 source: source::BUILTIN.to_string(),
                 enabled: true,
@@ -194,6 +203,8 @@ impl ToolRegistry {
             };
             groups[idx].entries.push(entry_from_spec(spec));
         }
+        // 未分配组固定在末尾，作为所有「无归属」条目的落点。
+        groups.push(make_unassigned_group());
         Self { version: REGISTRY_VERSION, groups }
     }
 
@@ -208,6 +219,7 @@ impl ToolRegistry {
                     self.groups.push(GroupRecord {
                         id: spec.group.to_string(),
                         name: label,
+                        description: String::new(),
                         kind: "tools".to_string(),
                         source: source::BUILTIN.to_string(),
                         enabled: true,
@@ -221,6 +233,11 @@ impl ToolRegistry {
                 self.groups[gi].entries.push(entry_from_spec(spec));
                 changed = true;
             }
+        }
+        // 旧注册表升级时补齐保留组（新生成的已由 from_catalog 建好）。
+        if !self.groups.iter().any(|g| g.id == UNASSIGNED_GROUP) {
+            self.groups.push(make_unassigned_group());
+            changed = true;
         }
         changed
     }
@@ -280,6 +297,78 @@ impl ToolRegistry {
 
     // ---------------------------------------------------------------- 操作
 
+    /// 新建一个用户组。失败时给出中文原因。
+    pub fn add_group(&mut self, id: &str, name: &str, description: &str) -> Result<(), String> {
+        if id.trim().is_empty() {
+            return Err("组 id 不能为空".to_string());
+        }
+        if name.trim().is_empty() {
+            return Err("组名称不能为空".to_string());
+        }
+        if id == UNASSIGNED_GROUP {
+            return Err("「未分配」是保留组，不能新建".to_string());
+        }
+        if self.groups.iter().any(|g| g.id == id) {
+            return Err(format!("组 id「{id}」已存在"));
+        }
+        self.groups.push(GroupRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: description.to_string(),
+            kind: "tools".to_string(),
+            source: source::PLUGIN.to_string(),
+            enabled: true,
+            entries: Vec::new(),
+        });
+        Ok(())
+    }
+
+    /// 重命名用户组（保留的「未分配」组不可改名）。
+    pub fn rename_group(&mut self, id: &str, name: &str) -> Result<(), String> {
+        if id == UNASSIGNED_GROUP {
+            return Err("「未分配」是保留组，不能改名".to_string());
+        }
+        if name.trim().is_empty() {
+            return Err("组名称不能为空".to_string());
+        }
+        let g = self.group_mut(id).ok_or_else(|| format!("组「{id}」不存在"))?;
+        g.name = name.to_string();
+        Ok(())
+    }
+
+    /// 设置组描述（管理 UI 的副标题）。
+    pub fn set_group_description(&mut self, id: &str, description: &str) -> Result<(), String> {
+        let g = self.group_mut(id).ok_or_else(|| format!("组「{id}」不存在"))?;
+        g.description = description.to_string();
+        Ok(())
+    }
+
+    /// 删除用户组：组内条目全部移入保留的「未分配」组，组本身删除。
+    ///
+    /// 返回实际移动的条目数。条目状态按 `move_entry` 规则保留，不重置开关。
+    pub fn remove_group(&mut self, id: &str) -> Result<usize, String> {
+        if id == UNASSIGNED_GROUP {
+            return Err("「未分配」是保留组，不能删除".to_string());
+        }
+        let tools: Vec<String> = self
+            .group(id)
+            .ok_or_else(|| format!("组「{id}」不存在"))?
+            .entries
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        let n = tools.len();
+
+        if self.group(UNASSIGNED_GROUP).is_none() {
+            self.groups.push(make_unassigned_group());
+        }
+        for tool in &tools {
+            self.move_entry(tool, UNASSIGNED_GROUP);
+        }
+        self.groups.retain(|g| g.id != id);
+        Ok(n)
+    }
+
     /// 组级启停。返回是否真的变了。
     pub fn set_group_enabled(&mut self, id: &str, on: bool) -> bool {
         match self.group_mut(id) {
@@ -292,9 +381,15 @@ impl ToolRegistry {
     }
 
     /// 条目级启停。返回是否真的变了。
+    ///
+    /// 「未分配」组的条目不允许启用：`on = true` 一律拒绝并返回 false。
     pub fn set_entry_enabled(&mut self, tool: &str, on: bool) -> bool {
         for g in &mut self.groups {
+            let is_unassigned = g.id == UNASSIGNED_GROUP;
             if let Some(e) = g.entries.iter_mut().find(|e| e.id == tool) {
+                if is_unassigned && on {
+                    return false;
+                }
                 if e.enabled != on {
                     e.enabled = on;
                     return true;
@@ -303,6 +398,58 @@ impl ToolRegistry {
             }
         }
         false
+    }
+
+    /// 安装单个条目（`discovered` → `ok`）。
+    ///
+    /// - 条目必须存在；已安装时幂等返回 Ok。
+    /// - `broken`（缺文件）给「文件缺失，无法安装」。
+    /// - 位于保留的「未分配」组时给「请先分配到组再安装」。
+    pub fn install_entry(&mut self, tool: &str) -> Result<(), String> {
+        let (gi, ei) = self
+            .groups
+            .iter()
+            .enumerate()
+            .find_map(|(gi, g)| {
+                g.entries.iter().position(|e| e.id == tool).map(|ei| (gi, ei))
+            })
+            .ok_or_else(|| format!("条目「{tool}」不存在"))?;
+
+        // 幂等优先：重复点击安装不应报错。
+        if self.groups[gi].entries[ei].installed {
+            return Ok(());
+        }
+        if self.groups[gi].id == UNASSIGNED_GROUP {
+            return Err("请先分配到组再安装".to_string());
+        }
+        if self.groups[gi].entries[ei].status == status::BROKEN {
+            return Err("文件缺失，无法安装".to_string());
+        }
+
+        let enabled = self.groups[gi].id != UNASSIGNED_GROUP;
+        let e = &mut self.groups[gi].entries[ei];
+        e.installed = true;
+        e.status = status::OK.to_string();
+        e.enabled = enabled;
+        Ok(())
+    }
+
+    /// 卸载单个条目：回到 `discovered`，`enabled = false`，条目保留在原组。
+    ///
+    /// 已卸载时幂等返回 Ok；条目不存在时给中文错误。
+    pub fn uninstall_entry(&mut self, tool: &str) -> Result<(), String> {
+        for g in &mut self.groups {
+            if let Some(e) = g.entries.iter_mut().find(|e| e.id == tool) {
+                if !e.installed {
+                    return Ok(());
+                }
+                e.installed = false;
+                e.status = status::DISCOVERED.to_string();
+                e.enabled = false;
+                return Ok(());
+            }
+        }
+        Err(format!("条目「{tool}」不存在"))
     }
 
     /// 安装一个组：把该组的候选条目全部转为已安装。
@@ -366,6 +513,7 @@ impl ToolRegistry {
                     self.groups.push(GroupRecord {
                         id: sg.id.clone(),
                         name: sg.name.clone(),
+                        description: String::new(),
                         kind: sg.kind.clone(),
                         source: if sg.source.is_empty() {
                             source::PLUGIN.to_string()
@@ -491,6 +639,7 @@ impl ToolRegistry {
                 self.groups.push(GroupRecord {
                     id: to_group.to_string(),
                     name: to_group.to_string(),
+                    description: String::new(),
                     kind: "tools".to_string(),
                     source: entry.source.clone(),
                     enabled: true,
@@ -507,6 +656,38 @@ impl ToolRegistry {
         };
         self.groups[to_idx].entries.push(entry);
         Some((from, to_group.to_string()))
+    }
+
+    /// 把条目分配到目标组。目标组必须已存在（不会隐式新建）。
+    ///
+    /// 复用 `move_entry` 完成迁移；已安装的条目迁移后自动启用，
+    /// 目标为保留的「未分配」组时一律关闭。
+    pub fn assign_entry(&mut self, tool: &str, group: &str) -> Result<(), String> {
+        if self.group(group).is_none() {
+            return Err(format!("目标组「{group}」不存在"));
+        }
+        let installed = self
+            .entry(tool)
+            .ok_or_else(|| format!("条目「{tool}」不存在"))?
+            .1
+            .installed;
+
+        self.move_entry(tool, group)
+            .ok_or_else(|| format!("条目「{tool}」不存在"))?;
+
+        for g in &mut self.groups {
+            if g.id == group {
+                if let Some(e) = g.entries.iter_mut().find(|e| e.id == tool) {
+                    if group == UNASSIGNED_GROUP {
+                        e.enabled = false;
+                    } else if installed {
+                        e.enabled = true;
+                    }
+                }
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// 统计（UI 顶部一行摘要）。
@@ -595,6 +776,19 @@ fn entry_from_spec(spec: &BuiltinSpec) -> EntryRecord {
     }
 }
 
+/// 构造保留的「未分配」组（三处初始化共用，避免字段漏填）。
+fn make_unassigned_group() -> GroupRecord {
+    GroupRecord {
+        id: UNASSIGNED_GROUP.to_string(),
+        name: "未分配".to_string(),
+        description: String::new(),
+        kind: "tools".to_string(),
+        source: source::BUILTIN.to_string(),
+        enabled: true,
+        entries: Vec::new(),
+    }
+}
+
 
 /// 扫描插件目录并转成快照（`registry list` / 装配 / CLI 共用）。
 ///
@@ -676,10 +870,33 @@ mod tests {
         d
     }
 
+    /// 构造只含一个扫描条目的快照，供安装/分配相关测试复用。
+    fn plugin_snapshot(group_id: &str, entry_id: &str, has_file: bool) -> ScanSnapshot {
+        ScanSnapshot {
+            groups: vec![ScannedGroup {
+                id: group_id.to_string(),
+                name: group_id.to_string(),
+                kind: "tools".into(),
+                source: source::PLUGIN.into(),
+                entries: vec![ScannedEntry {
+                    id: entry_id.to_string(),
+                    name: entry_id.to_string(),
+                    risk: "low".into(),
+                    capabilities: vec![],
+                    path: format!("{entry_id}.dll"),
+                    has_file,
+                    note: String::new(),
+                }],
+            }],
+        }
+    }
+
     #[test]
     fn from_catalog_covers_all_builtins() {
         let reg = ToolRegistry::from_catalog();
-        assert_eq!(reg.groups.len(), catalog::CAP_GROUPS.len());
+        // 内置能力组 + 末尾一个保留的「未分配」组
+        assert_eq!(reg.groups.len(), catalog::CAP_GROUPS.len() + 1);
+        assert_eq!(reg.groups.last().unwrap().id, UNASSIGNED_GROUP);
         for spec in catalog::BUILTIN_SPECS {
             let (g, e) = reg.entry(spec.name).unwrap_or_else(|| panic!("缺 {}", spec.name));
             assert_eq!(g.id, spec.group);
@@ -863,5 +1080,173 @@ mod tests {
         assert_eq!(g.id, "shell", "扫描不得把条目拉回原组");
         assert_eq!(e.status, status::OK, "文件还在，状态应保持 ok");
         assert_eq!(rep.new_entries, 0, "不该在 file 组里再建一份");
+    }
+
+    // ---------------------------------------------------------------- 契约 A
+
+    #[test]
+    fn unassigned_group_is_initialized_last_and_empty() {
+        let reg = ToolRegistry::from_catalog();
+        let g = reg.groups.last().unwrap();
+        assert_eq!(g.id, UNASSIGNED_GROUP);
+        assert_eq!(g.name, "未分配");
+        assert_eq!(g.kind, "tools");
+        assert_eq!(g.source, source::BUILTIN);
+        assert!(g.enabled);
+        assert!(g.entries.is_empty());
+
+        // 旧注册表（没有该组）升级时补齐，且不会重复添加
+        let mut old = ToolRegistry::default();
+        assert!(old.ensure_builtins());
+        assert_eq!(old.groups.last().unwrap().id, UNASSIGNED_GROUP);
+        assert!(!old.ensure_builtins(), "补齐后二次调用应无改动");
+        assert_eq!(old.groups.iter().filter(|g| g.id == UNASSIGNED_GROUP).count(), 1);
+    }
+
+    #[test]
+    fn new_scanned_entries_are_discovered_in_their_group() {
+        let snap = plugin_snapshot("newplug", "newplug.hello", true);
+        let mut reg = ToolRegistry::from_catalog();
+        let rep = reg.merge_scan(&snap);
+        assert_eq!(rep.new_groups, 1);
+        assert_eq!(rep.new_entries, 1);
+
+        let (g, e) = reg.entry("newplug.hello").unwrap();
+        assert_eq!(g.id, "newplug", "新组的新条目仍放原扫描组");
+        assert_eq!(e.status, status::DISCOVERED, "未安装的新条目应标记为 discovered");
+        assert!(!e.installed);
+        assert!(!e.enabled);
+    }
+
+    // ---------------------------------------------------------------- 契约 B
+
+    #[test]
+    fn group_crud_add_rename_describe_and_remove() {
+        let mut reg = ToolRegistry::from_catalog();
+        reg.add_group("tools", "我的工具", "原始描述").unwrap();
+        {
+            let g = reg.group("tools").unwrap();
+            assert_eq!(g.name, "我的工具");
+            assert_eq!(g.description, "原始描述");
+            assert_eq!(g.source, source::PLUGIN);
+        }
+
+        reg.rename_group("tools", "改名后").unwrap();
+        assert_eq!(reg.group("tools").unwrap().name, "改名后");
+        reg.set_group_description("tools", "新描述").unwrap();
+        assert_eq!(reg.group("tools").unwrap().description, "新描述");
+
+        // 删除组：组内条目全部落到未分配组
+        reg.move_entry("file.read", "tools").unwrap();
+        let n = reg.remove_group("tools").unwrap();
+        assert_eq!(n, 1);
+        assert!(reg.group("tools").is_none());
+        let (g, _) = reg.entry("file.read").unwrap();
+        assert_eq!(g.id, UNASSIGNED_GROUP);
+    }
+
+    #[test]
+    fn group_crud_rejects_invalid_args_and_reserved_group() {
+        let mut reg = ToolRegistry::from_catalog();
+        assert!(reg.add_group("", "名字", "").unwrap_err().contains("不能为空"));
+        assert!(reg.add_group("id", "", "").unwrap_err().contains("不能为空"));
+        assert!(reg.add_group(UNASSIGNED_GROUP, "未分配", "").unwrap_err().contains("保留"));
+        assert!(reg.add_group("file", "重复", "").unwrap_err().contains("已存在"));
+
+        assert!(reg.rename_group(UNASSIGNED_GROUP, "x").is_err());
+        assert!(reg.rename_group("nope", "x").unwrap_err().contains("不存在"));
+        assert!(reg.set_group_description("nope", "x").is_err());
+        assert!(reg.remove_group(UNASSIGNED_GROUP).unwrap_err().contains("保留"));
+        assert!(reg.remove_group("nope").is_err());
+    }
+
+    // ---------------------------------------------------------------- 契约 C
+
+    #[test]
+    fn install_and_uninstall_single_entry() {
+        let mut reg = ToolRegistry::from_catalog();
+        reg.merge_scan(&plugin_snapshot("plug", "plug.a", true));
+        assert_eq!(reg.entry("plug.a").unwrap().1.status, status::DISCOVERED);
+
+        reg.install_entry("plug.a").unwrap();
+        {
+            let (g, e) = reg.entry("plug.a").unwrap();
+            assert_eq!(g.id, "plug");
+            assert!(e.installed);
+            assert_eq!(e.status, status::OK);
+            assert!(e.enabled);
+        }
+        reg.install_entry("plug.a").unwrap(); // 幂等
+
+        reg.uninstall_entry("plug.a").unwrap();
+        {
+            let (g, e) = reg.entry("plug.a").unwrap();
+            assert_eq!(g.id, "plug", "卸载后条目仍留在原组");
+            assert!(!e.installed);
+            assert_eq!(e.status, status::DISCOVERED);
+            assert!(!e.enabled);
+        }
+        reg.uninstall_entry("plug.a").unwrap(); // 幂等
+
+        assert!(reg.install_entry("nope").is_err());
+        assert!(reg.uninstall_entry("nope").is_err());
+    }
+
+    #[test]
+    fn install_entry_rejects_broken_and_unassigned() {
+        let mut reg = ToolRegistry::from_catalog();
+        reg.merge_scan(&plugin_snapshot("plug", "plug.broken", false));
+        assert_eq!(reg.entry("plug.broken").unwrap().1.status, status::BROKEN);
+        assert!(reg.install_entry("plug.broken").unwrap_err().contains("文件缺失，无法安装"));
+
+        reg.merge_scan(&plugin_snapshot("plug2", "plug.ok", true));
+        reg.assign_entry("plug.ok", UNASSIGNED_GROUP).unwrap();
+        assert!(reg.install_entry("plug.ok").unwrap_err().contains("请先分配到组再安装"));
+    }
+
+    #[test]
+    fn unassigned_entry_cannot_be_enabled() {
+        let mut reg = ToolRegistry::from_catalog();
+        reg.assign_entry("file.read", UNASSIGNED_GROUP).unwrap();
+        assert_eq!(reg.entry("file.read").unwrap().0.id, UNASSIGNED_GROUP);
+        assert!(!reg.set_entry_enabled("file.read", true), "未分配条目不可启用");
+        assert!(!reg.entry("file.read").unwrap().1.enabled);
+
+        // 普通组的启停不受影响
+        assert!(reg.set_entry_enabled("file.write", false));
+        assert!(reg.set_entry_enabled("file.write", true));
+    }
+
+    // ---------------------------------------------------------------- 契约 D
+
+    #[test]
+    fn assign_entry_moves_and_updates_enabled() {
+        let mut reg = ToolRegistry::from_catalog();
+        reg.add_group("tools", "我的工具", "").unwrap();
+
+        // 已安装条目分配到普通组 → 自动启用
+        reg.assign_entry("file.read", "tools").unwrap();
+        let (g, e) = reg.entry("file.read").unwrap();
+        assert_eq!(g.id, "tools");
+        assert!(e.installed && e.enabled);
+
+        // 目标组不存在 → 中文错误，且不移动条目
+        assert!(reg.assign_entry("file.write", "nope").unwrap_err().contains("不存在"));
+        assert_eq!(reg.entry("file.write").unwrap().0.id, "file");
+
+        // 未安装条目分配到普通组 → 保持未启用
+        reg.merge_scan(&plugin_snapshot("plug", "plug.y", true));
+        reg.assign_entry("plug.y", "tools").unwrap();
+        let (_, e) = reg.entry("plug.y").unwrap();
+        assert!(!e.installed);
+        assert!(!e.enabled);
+
+        // 安装后分配到未分配组 → 关闭启用
+        reg.install_entry("plug.y").unwrap();
+        assert!(reg.entry("plug.y").unwrap().1.enabled);
+        reg.assign_entry("plug.y", UNASSIGNED_GROUP).unwrap();
+        let (g, e) = reg.entry("plug.y").unwrap();
+        assert_eq!(g.id, UNASSIGNED_GROUP);
+        assert!(!e.enabled);
     }
 }

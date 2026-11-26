@@ -170,6 +170,20 @@ pub fn apply_net_settings(cfg: &AppConfig) {
     });
 }
 
+/// 把配置里的 python/pip 路径注入环境变量（#13.1）。
+/// 留空则清掉变量，让 pysandbox 回退自动探测——这样"删掉路径"能立即生效，
+/// 不必重启进程才恢复默认。
+pub fn apply_python_settings(cfg: &AppConfig) {
+    match cfg.sandbox.python_path.as_deref().map(str::trim) {
+        Some(p) if !p.is_empty() => std::env::set_var("WPA_PYTHON_PATH", p),
+        _ => std::env::remove_var("WPA_PYTHON_PATH"),
+    }
+    match cfg.sandbox.pip_path.as_deref().map(str::trim) {
+        Some(p) if !p.is_empty() => std::env::set_var("WPA_PIP_PATH", p),
+        _ => std::env::remove_var("WPA_PIP_PATH"),
+    }
+}
+
 /// 进程级装配。
 pub async fn assemble(cfg: &AppConfig, _cli_tree: Option<PathBuf>) -> anyhow::Result<Base> {
     // 配置先自检：非法配置不进入装配（fail-closed）
@@ -182,6 +196,10 @@ pub async fn assemble(cfg: &AppConfig, _cli_tree: Option<PathBuf>) -> anyhow::Re
     // 网络参数安装：net.* 工具由内核统一构造，拿不到配置引用，只能由装配层灌进去。
     // 放在装配最前面 —— 任何工具第一次调用前生效。
     apply_net_settings(cfg);
+    // python/pip 可配置路径（#13.1）：写进环境变量供 pysandbox 消费；
+    // 留空时不设置，由 pysandbox 回退到"程序子目录自动探测"。
+    // 用 set_var 是进程级的，但装配只在启动/会话边界发生，且值来自同一份配置。
+    apply_python_settings(cfg);
     let workspaces = Arc::new(
         WorkspaceRegistry::open(cfg.workspaces_root())
             .map_err(|e| anyhow::anyhow!("打开空间注册表失败：{e}"))?,
@@ -516,22 +534,30 @@ pub fn build_session(base: &Base, opts: SessionOpts) -> (ChatSession, SessionInf
     let active: Option<Workspace> = base.workspaces.active();
     let space_name = active.as_ref().map(|w| w.name.clone()).unwrap_or_default();
 
-    // 2) 授权范围：CLI > 空间 > 配置
+    // 2) 授权范围：CLI > 空间(可覆盖全局) > 配置
+    //    空间可覆盖全局（用户拍板）：空间 scope 非空就用它，否则回落全局；
+    //    无论哪种，再叠加空间的 extra_scope（追加授权目标）。
     let cli_targets = &opts.targets;
     let scope = if !cli_targets.is_empty() {
         cli_targets.clone()
-    } else if let Some(w) = active.as_ref().filter(|w| !w.scope.is_empty()) {
-        w.scope.clone()
+    } else if let Some(w) = active.as_ref() {
+        let base_scope = if w.scope.is_empty() {
+            cfg.scope.authorized.clone()
+        } else {
+            w.scope.clone()
+        };
+        w.effective_scope(&base_scope)
     } else {
         cfg.scope.authorized.clone()
     };
 
     // 3) 拒绝清单：配置 + 空间（并集，只能更严）
+    //    空间的 deny 与 extra_deny 都并入——红线永远只叠加、不放宽。
     let mut deny: Vec<String> = base.denylist.as_ref().clone();
     if let Some(w) = &active {
-        for d in &w.deny {
-            if !deny.contains(d) {
-                deny.push(d.clone());
+        for d in w.effective_deny(&w.deny) {
+            if !deny.contains(&d) {
+                deny.push(d);
             }
         }
     }
@@ -1000,6 +1026,18 @@ impl Base {
                 scope: w.scope.len(),
                 cwd: w.cwd.clone(),
                 trees: w.trees.clone(),
+                authorized: w.scope.clone(),
+                whitelist: w.plugins.clone(),
+                approval: match w.auto_approve {
+                    Some(true) => "auto".to_string(),
+                    Some(false) => "ask".to_string(),
+                    None => "global".to_string(),
+                },
+                sandbox: match w.restricted_token {
+                    Some(true) => "strict".to_string(),
+                    Some(false) => "relaxed".to_string(),
+                    None => "global".to_string(),
+                },
                 plugins: w.plugins.len(),
                 skills: w.skills.len(),
                 note: w.note.clone(),
@@ -1064,6 +1102,7 @@ impl Base {
                 .map(|g| crate::snapshot::RegGroupRow {
                     id: g.id.clone(),
                     label: g.name.clone(),
+                    description: g.description.clone(),
                     source: g.source.clone(),
                     enabled: g.enabled,
                     total: g.entries.len(),

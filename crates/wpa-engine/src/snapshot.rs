@@ -25,6 +25,14 @@ pub struct SpaceRow {
     pub scope: usize,
     pub cwd: String,
     pub trees: Vec<String>,
+    /// 授权目标明细（空间页可编辑）
+    pub authorized: Vec<String>,
+    /// 工具白名单明细（组 id / 工具名）
+    pub whitelist: Vec<String>,
+    /// 审批三态：global / auto / ask
+    pub approval: String,
+    /// 沙箱三态：global / strict / relaxed
+    pub sandbox: String,
     /// 工具白名单条数（0 = 全部）
     pub plugins: usize,
     pub skills: usize,
@@ -114,6 +122,8 @@ pub struct CapGroupRow {
 pub struct RegGroupRow {
     pub id: String,
     pub label: String,
+    /// 用户可编辑的组描述（管理 UI 的副标题）。
+    pub description: String,
     /// builtin / plugin / declarative
     pub source: String,
     pub enabled: bool,
@@ -125,6 +135,19 @@ pub struct RegGroupRow {
     pub broken: usize,
     /// 未安装的条数
     pub discovered: usize,
+}
+
+/// 该组是否进入「插件工具管理」UI。
+///
+/// `core` / `sandbox` / `shell` / `space` / `memory` 这 5 组是基座内置基础能力，
+/// 由基座自己管理，不进插件工具管理界面；其余组（含「未分配」）都归 UI 管理。
+pub fn is_managed_group(id: &str) -> bool {
+    !matches!(id, "core" | "sandbox" | "shell" | "space" | "memory")
+}
+
+/// 是否为保留的「未分配」组。
+pub fn is_unassigned(id: &str) -> bool {
+    id == "__unassigned__"
 }
 
 /// 注册表里的一个条目（能力页中栏）。
@@ -199,5 +222,32 @@ mod tests {
         assert!(line.contains("未配置模型"));
         assert!(line.contains("全局"));
         assert!(line.contains("工具 0 个"));
+    }
+
+    #[test]
+    fn managed_group_excludes_five_builtin_base_groups() {
+        for id in ["core", "sandbox", "shell", "space", "memory"] {
+            assert!(!is_managed_group(id), "{id} 是内置基础能力组，不应进插件管理 UI");
+        }
+        assert!(is_managed_group("file"));
+        assert!(is_managed_group("net"));
+        assert!(is_managed_group("text"));
+        assert!(is_managed_group("my_plugin"));
+        assert!(is_managed_group("__unassigned__"), "未分配组也归管理 UI 使用");
+    }
+
+    #[test]
+    fn is_unassigned_only_matches_reserved_id() {
+        assert!(is_unassigned("__unassigned__"));
+        assert!(!is_unassigned("core"));
+        assert!(!is_unassigned("未分配"));
+        assert!(!is_unassigned(""));
+    }
+
+    #[test]
+    fn reg_group_row_carries_description() {
+        let mut row = RegGroupRow::default();
+        row.description = "示例描述".to_string();
+        assert_eq!(row.description, "示例描述");
     }
 }
