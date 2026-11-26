@@ -6,8 +6,8 @@ export component FlickableList inherits Rectangle {
     
     callback item-clicked(int, string);
 
-    // Scroll offset (Flickable viewport-y is negative or 0)
-    property <length> scroll-offset: -flick.viewport-y;
+    // Scroll offset (Flickable content-y is negative or 0)
+    property <length> scroll-offset: -flick.content-y;
     
     // Index of the first visible item
     property <int> first-visible-index: Math.max(0, Math.floor(root.scroll-offset / root.item-height));
@@ -23,12 +23,12 @@ export component FlickableList inherits Rectangle {
         height: 100%;
         
         // Total virtual height of the list content
-        viewport-height: root.items.length * root.item-height;
+        content-height: root.items.length * root.item-height;
 
         // Container of virtualized items
         Rectangle {
             width: 100%;
-            height: parent.viewport-height;
+            height: parent.content-height;
 
             // Instantiate a fixed window of 20 slots to handle screens up to 800px high
             for slot-index in 20 : Rectangle {

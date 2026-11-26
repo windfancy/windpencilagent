@@ -15,7 +15,8 @@ name = "windpencilagent"
 path = "src/main.rs"
 
 [build-dependencies]
-slint-build = "=1.13.1"
+slint-build = "=1.19.0"
+winresource = "0.1"
 
 [dependencies]
 # Slint 默认 features 会拉三样本项目用不到的东西（2026-11-26 实测后收窄）：
@@ -23,7 +24,7 @@ slint-build = "=1.13.1"
 #   renderer-software                     本机只走 femtovg/OpenGL，软件渲染路径不会被选中
 #   accessibility → accesskit_windows     本项目未接无障碍，accesskit 的 .text 白占
 # 只留：std + winit 后端 + femtovg 渲染器 + 1.2 兼容层
-slint = { version = "=1.13.1", default-features = false, features = [
+slint = { version = "=1.19.0", default-features = false, features = [
     "std",
     "backend-winit",
     "renderer-femtovg",
