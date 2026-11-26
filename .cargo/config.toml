@@ -1,0 +1,8 @@
+# 编译并行度限制：本机 8 逻辑核 / 31.7GB 内存，cargo 默认开 8 个 rustc 并行，
+# 709 个依赖里 slint/reqwest/tokio/wpa-engine 等大 crate 单进程峰值 2-4GB，
+# 8 路并行叠加会顶满可用内存（约 20.75GB），触发内存保护 kill 进程。
+# 降到 4 路后峰值内存减半，代价是编译时间略增。
+# 注意：此处只设 [build]，不设 [source]，全局 ~/.cargo/config.toml 的 ustc 稀疏源配置
+# 仍正常生效，两者合并不会冲突。
+[build]
+jobs = 4
