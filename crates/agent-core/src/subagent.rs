@@ -21,7 +21,7 @@ pub type ProviderCell = Arc<std::sync::RwLock<Option<Arc<dyn LlmProvider>>>>;
 /// `subagent.spawn`：派生一个受限子代理执行独立子任务并取回结论。
 pub struct SubagentTool {
     provider: ProviderCell,
-    /// 共享主 registry：call 时动态收集受限工具面（含 MCP 等后注册工具）
+    /// 共享主 registry：call 时动态收集受限工具面（含后注册工具）
     registry: Arc<Registry>,
     executor: Arc<dyn ToolExecutor>,
     authorized_scope: Vec<String>,

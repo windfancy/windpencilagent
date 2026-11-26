@@ -19,13 +19,6 @@ pub enum RegistryError {
     Incompatible(String, &'static str),
 }
 
-/// 装配阶段错误（从配置驱动组合时产生）。
-#[derive(Debug, Error)]
-pub enum AssemblyError {
-    #[error("assembly failed: {0}")]
-    Generic(String),
-}
-
 /// 组件注册表。按 `(kind, name)` 键控。
 ///
 /// 组件以多态 `Arc<dyn Component>` 登记，支持统一展示与生命周期；

@@ -6,13 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 indexmap.workspace = true
-
-[dev-dependencies]
-tokio.workspace = true

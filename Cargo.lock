@@ -477,35 +477,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "base-mcp"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "kern-core",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "toolkit-core",
- "tracing",
-]
-
-[[package]]
-name = "base-skills"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "kern-core",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "toolkit-core",
- "tracing",
- "zip",
-]
-
-[[package]]
 name = "base-store"
 version = "0.1.0"
 dependencies = [
@@ -2806,7 +2777,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "tokio",
  "uuid",
 ]
 
@@ -5258,6 +5228,7 @@ dependencies = [
  "sha2",
  "tokio",
  "toolkit-core",
+ "wpa-kit",
 ]
 
 [[package]]

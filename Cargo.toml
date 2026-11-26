@@ -10,8 +10,6 @@ members = [
     "crates/base-store",
     "crates/toolkit-core",
     "crates/base-llm",
-    "crates/base-mcp",
-    "crates/base-skills",
     "crates/agent-core",
     "crates/shell-core",
     "crates/workspace-core",

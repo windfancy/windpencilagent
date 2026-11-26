@@ -37,7 +37,7 @@ min_risk = "medium"
 id = "gen.no-outbound-without-approval"
 text = "对外发送任何内容（发消息、发邮件、提交 PR、调第三方写接口、上传文件）前，必须把「发给谁、发什么、能不能撤回」说清楚并得到确认。不要把用户的本地数据当成可以自由外发的素材。"
 severity = "must"
-tools = ["net.*", "web.*", "http.*", "mcp.*"]
+tools = ["net.*", "web.*", "http.*"]
 min_risk = "medium"
 
 # --- 4. 系统配置不静默修改 ---------------------------------------------------

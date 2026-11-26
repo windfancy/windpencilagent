@@ -1,7 +1,9 @@
 //! 编解码：base64 / base64url / url / hex / html entity。
 //!
-//! 自研实现（不引 percent-encoding 之类的小依赖），因为规则简单且需要可控的
-//! 错误行为：解码失败必须报错，**不能**静默丢字节。
+//! URL 编解码复用 `wpa-kit::codec`（与插件 SDK 共享同一实现，避免两份漂移）；
+//! 其余自研，保证解码失败必须报错、不静默丢字节。
+
+use wpa_kit::codec::{url_decode, url_encode};
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -14,7 +16,7 @@ pub fn encode(scheme: &str, data: &str) -> Result<String, String> {
         "base64" => Ok(STANDARD.encode(data.as_bytes())),
         "base64url" => Ok(URL_SAFE_NO_PAD.encode(data.as_bytes())),
         "hex" => Ok(data.as_bytes().iter().map(|b| format!("{b:02x}")).collect()),
-        "url" => Ok(url_encode(data)),
+        "url" => Ok(url_encode(data, false)),
         "html" => Ok(html_encode(data)),
         other => Err(format!("不支持的编码方案：{other}（可选 {}）", SCHEMES.join("/"))),
     }
@@ -55,51 +57,6 @@ pub fn decode(scheme: &str, data: &str) -> Result<String, String> {
         "html" => Ok(html_decode(data)),
         other => Err(format!("不支持的解码方案：{other}（可选 {}）", SCHEMES.join("/"))),
     }
-}
-
-fn url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*b as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
-}
-
-fn url_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
-                match u8::from_str_radix(hex, 16) {
-                    Ok(b) => {
-                        out.push(b);
-                        i += 3;
-                    }
-                    Err(_) => {
-                        out.push(b'%');
-                        i += 1;
-                    }
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).to_string()
 }
 
 fn html_encode(s: &str) -> String {

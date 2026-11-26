@@ -28,7 +28,7 @@ pub trait ApiTool: Send + Sync + 'static {
     /// 任何"要做什么"的描述——规划器、领域配置、约束文件、workflow——
     /// 都不得写工具名，只能写[能力标签](crate::registry::caps)。
     /// 理由：工具可安装、可卸载、可被同样能力的另一个实现替换，
-    /// 名字一旦被写死就会静默失效（见 `kern_loop::StaticPlanner` 的旧实现）。
+    /// 名字一旦被写死就会静默失效（旧版静态规划器曾因此故障）。
     fn name(&self) -> &str;
     fn description(&self) -> String;
     /// JSON Schema（OpenAI function-calling 规范）。

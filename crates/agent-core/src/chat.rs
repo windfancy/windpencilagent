@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 /// 审批回调：工具名、风险级别、参数摘要 → 是否放行。
 pub type ApprovalCallback = Arc<dyn Fn(&str, RiskLevel, &str) -> bool + Send + Sync>;
 
-/// 技能注入单元（来自 SkillManager 已启用技能，与 base-skills 解耦）。
+/// 技能注入单元（来自树包提供的技能，渐进披露）。
 #[derive(Debug, Clone, Default)]
 pub struct SkillNote {
     pub name: String,

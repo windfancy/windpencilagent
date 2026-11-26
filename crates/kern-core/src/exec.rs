@@ -1,6 +1,6 @@
 //! 执行契约：内核层与基础能力层之间的工具执行接口。
 //!
-//! 内核层（kern-loop）只依赖本契约；具体实现由 toolkit-core 提供，
+//! 内核层只依赖本契约；具体实现由 toolkit-core 提供，
 //! 保证「低层不依赖高层」的分层约束。
 
 use serde::{Deserialize, Serialize};
