@@ -159,21 +159,13 @@ cargo build --release --workspace
 
 **没有配置模型也不会崩**，只是进入降级模式：只有通用工具，不调 LLM。
 
-### 示例插件（可选）
+### 加插件
 
-插件是**独立 workspace**，且仓库不提交编译产物（`*.dll` 被本地排除）。所以要看到示例插件，得单独编译并放回条目目录：
+仓库**不含插件源码**，`plugins/` 是运行时目录，从空开始。
 
-```bash
-cd plugins
-cargo build --release
+**用现成的 dll**：把 dll 丢进 `plugins/` 根目录，下次启动自动收编进「未分配」组，再在「能力」页安装、分配、启用。
 
-# 扫描只认 <组>/<条目>/ 下的 dll，所以要把产物拷回去
-cp target/release/file_path_info.dll file/file.path_info/
-cp target/release/file_demo.dll      file/file.demo/
-cd ..
-```
-
-`text_upper` 是声明式插件，只有 `PnC.toml`、无需编译。重启程序后，在「能力」页安装并分配到组即可。
+**自己写一个**：需要 `plugin-sdk`（插件与宿主共用的 HostApi 封装）与 `plugins/Cargo.toml` 这个 workspace 骨架。二者不随本仓库发布，需向作者索取；拿到后放进 `plugins/`，再用 `windpencilagent-cli new-plugin --id <命名空间.名字> --group <组>` 生成可编译的插件工程。
 
 ### 配模型
 
@@ -297,7 +289,7 @@ cargo build --release         # 发布构建
 
 ## 已知边界
 
-- **不含任何业务插件**：`plugins/` 只带三个纯计算示例，业务能力在别的工程。
+- **不含插件源码与 SDK**：`plugins/` 由你自建，仓库只提供运行时、ABI 与收编链路；示例插件与 `plugin-sdk` 不随仓库分发。
 - **只支持 Windows**：受限令牌、AppContainer、插件 ABI 均按 Windows 实现。部分沙箱测试在受限环境里跑不起来，标了 `#[ignore]`。
 - **界面未签名**：首次运行可能弹 SmartScreen「未知发布者」，需点「更多信息 → 仍要运行」。
 - **`web.*`（无头浏览器）暂未暴露成工具**，只供插件通过 HostApi 使用。
