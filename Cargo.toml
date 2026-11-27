@@ -31,10 +31,10 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.92"
-# 非商业许可：个人/研究/教学免费，商业用途需事先书面授权。
-# 见根目录 LICENSE。Cargo 不接受自定义 SPDX 标识符，故用 license-file
-# 指向全文；子 crate 通过 `license-file.workspace = true` 继承。
-license-file = "LICENSE"
+# Apache-2.0：允许商用、修改、再分发，需保留版权与许可声明。
+# 全文见根目录 LICENSE，版权声明见 NOTICE；子 crate 通过
+# `license.workspace = true` 继承。
+license = "Apache-2.0"
 authors = ["windpencilagent Team"]
 
 [workspace.dependencies]

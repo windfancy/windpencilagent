@@ -3,7 +3,7 @@ name = "knowledge-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 description = "基座知识原语：文件式知识提供者（分级检索 + 约束 + 学习回写）"
 
 [dependencies]

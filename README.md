@@ -6,9 +6,9 @@
 <p>
 <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.92%2B-orange.svg" alt="Rust"></a>
 <img src="https://img.shields.io/badge/platform-Windows-0078D6.svg" alt="Windows">
-<a href="LICENSE"><img src="https://img.shields.io/badge/license-NonCommercial-red.svg" alt="License"></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
 </p>
-<p>非商业用途免费 · <strong>商业用途需授权</strong> · 见 <a href="LICENSE">LICENSE</a></p>
+<p>Apache License 2.0 · 可商用、可修改、可再分发 · 见 <a href="LICENSE">LICENSE</a></p>
 </div>
 
 ---
@@ -299,16 +299,15 @@ cargo build --release         # 发布构建
 
 ## 许可证
 
-本项目采用**非商业许可**（[LICENSE](LICENSE)）：
+本项目采用 **Apache License 2.0**（全文 [LICENSE](LICENSE)，版权声明 [NOTICE](NOTICE)）。
 
-| 用途 | 是否需要授权 |
+| | 内容 |
 |---|---|
-| 个人学习、研究、教学、技术评估 | 免费，无需申请 |
-| 非商业开源项目引用 | 免费，需保留许可证与版权声明 |
-| 商业产品集成、企业内部经营使用 | **需事先书面授权** |
-| 收费托管 / SaaS / API 服务 | **需事先书面授权** |
-| 有偿咨询、培训、外包、定制开发 | **需事先书面授权** |
+| 允许 | 商业使用、修改、再分发、私人使用，并附带专利许可 |
+| 条件 | 保留版权、许可与 `NOTICE`；显著标注修改过的文件 |
+| 不授予 | 商标权；不得用本项目名称或作者名义为衍生品背书 |
+| 担保 | 无。按「原样」提供，不承担任何明示或默示担保 |
 
-商业授权请在 [Issues](https://github.com/windfancy/windpencilagent/issues) 提交说明用途的申请。
+分发二进制或衍生作品时，请一并附带 `LICENSE` 与 `NOTICE`。
 
-第三方依赖各自遵循其原始许可证（主要为 MIT / Apache-2.0），完整清单见 `Cargo.lock`。
+第三方依赖各自遵循其原始许可证（多为 MIT / Apache-2.0），完整清单见 `Cargo.lock`。

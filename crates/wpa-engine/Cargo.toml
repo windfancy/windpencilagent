@@ -3,7 +3,7 @@ name = "wpa-engine"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 description = "基座装配引擎：配置 / 契约宿主 / 工具装配 / 会话构建 / UI 快照"
 
 [dependencies]

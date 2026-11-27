@@ -3,6 +3,7 @@ name = "browser-core"
 version.workspace = true
 edition.workspace = true
 description = "无头 HTTP 浏览器：会话池 + Cookie 池 + 批量限流 + HTML 解析（无 JS 引擎）"
+license.workspace = true
 
 [dependencies]
 wpa-kit = { path = "../wpa-kit" }

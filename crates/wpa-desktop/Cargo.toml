@@ -3,7 +3,7 @@ name = "wpa-desktop"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 description = "windpencilagent 基座桌面端（Slint）：对话 / 内置能力 / 领域 / 空间 / 模型 / 工具（Slint）：对话 / 任务 / 智能树 / 空间 / 记忆 / 模型 / 设置"
 
 [lib]

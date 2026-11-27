@@ -3,7 +3,7 @@ name = "wpa-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 description = "windpencilagent 基座 CLI：无树启动即通用对话智能体"
 
 [[bin]]

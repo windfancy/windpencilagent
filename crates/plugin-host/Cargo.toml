@@ -3,6 +3,7 @@ name = "plugin-host"
 version.workspace = true
 edition.workspace = true
 description = "插件宿主：扫描/注册表/拓扑/加载/熔断/工具适配"
+license.workspace = true
 
 [dependencies]
 wpa-api = { path = "../wpa-api" }

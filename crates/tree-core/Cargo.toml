@@ -3,7 +3,7 @@ name = "tree-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 description = "树包（智能树数据包）：清单解析 / 声明式工具 / 插槽 / 安装器 / 约束钩子 / 阶段"
 
 [dependencies]

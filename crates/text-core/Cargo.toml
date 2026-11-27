@@ -3,7 +3,7 @@ name = "text-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 description = "基座文本原语：编解码 / 哈希 / 正则 / 结构化提取 / 变换"
 
 [dependencies]

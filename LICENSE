@@ -1,137 +1,201 @@
-windpencilagent Non-Commercial License
-Version 1.0, 2026-11-28
+                              Apache License
+                        Version 2.0, January 2004
+                     http://www.apache.org/licenses/
 
-Copyright (c) 2026 windfancy. All rights reserved.
+TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
 
-===============================================================================
-SUMMARY IN ENGLISH
-===============================================================================
+1. Definitions.
 
-This software is source-available, NOT open source in the OSI sense.
+   "License" shall mean the terms and conditions for use, reproduction,
+   and distribution as defined by Sections 1 through 9 of this document.
 
-You MAY use, copy, modify and redistribute it free of charge for
-non-commercial purposes, provided you keep this license and the copyright
-notice, and mark your modifications.
+   "Licensor" shall mean the copyright owner or entity authorized by
+   the copyright owner that is granting the License.
 
-You MAY NOT use it for any commercial purpose — including embedding it in a
-commercial product or service, operating it as part of revenue-generating
-business activity, or offering paid hosted/SaaS access — without a separate
-written commercial license from the copyright holder.
+   "Legal Entity" shall mean the union of the acting entity and all
+   other entities that control, are controlled by, or are under common
+   control with that entity. For the purposes of this definition,
+   "control" means (i) the power, direct or indirect, to cause the
+   direction or management of such entity, whether by contract or
+   otherwise, or (ii) ownership of fifty percent (50%) or more of the
+   outstanding shares, or (iii) beneficial ownership of such entity.
 
-To request a commercial license, open an issue at
-https://github.com/windfancy/windpencilagent/issues
+   "You" (or "Your") shall mean an individual or Legal Entity
+   exercising permissions granted by this License.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+   "Source" form shall mean the preferred form for making modifications,
+   including but not limited to software source code, documentation
+   source, and configuration files.
 
-In case of any discrepancy between the English summary and the Chinese terms
-below, the Chinese terms prevail.
+   "Object" form shall mean any form resulting from mechanical
+   transformation or translation of a Source form, including but
+   not limited to compiled object code, generated documentation,
+   and conversions to other media types.
 
-===============================================================================
-中文条款
-===============================================================================
+   "Work" shall mean the work of authorship, whether in Source or
+   Object form, made available under the License, as indicated by a
+   copyright notice that is included in or attached to the work
+   (an example is provided in the Appendix below).
 
-第一条　定义
+   "Derivative Works" shall mean any work, whether in Source or Object
+   form, that is based on (or derived from) the Work and for which the
+   editorial revisions, annotations, elaborations, or other modifications
+   represent, as a whole, an original work of authorship. For the purposes
+   of this License, Derivative Works shall not include works that remain
+   separable from, or merely link (or bind by name) to the interfaces of,
+   the Work and Derivative Works thereof.
 
-1.1 "本软件"指本仓库（https://github.com/windfancy/windpencilagent）中包含
-    的全部源代码、二进制文件、配置文件、文档与示例，及其后续版本。
+   "Contribution" shall mean any work of authorship, including
+   the original version of the Work and any modifications or additions
+   to that Work or Derivative Works thereof, that is intentionally
+   submitted to Licensor for inclusion in the Work by the copyright owner
+   or by an individual or Legal Entity authorized to submit on behalf of
+   the copyright owner. For the purposes of this definition, "submitted"
+   means any form of electronic, verbal, or written communication sent
+   to the Licensor or its representatives, including but not limited to
+   communication on electronic mailing lists, source code control systems,
+   and issue tracking systems that are managed by, or on behalf of, the
+   Licensor for the purpose of discussing and improving the Work, but
+   excluding communication that is conspicuously marked or otherwise
+   designated in writing by the copyright owner as "Not a Contribution."
 
-1.2 "著作权人"指 windfancy。
+   "Contributor" shall mean Licensor and any individual or Legal Entity
+   on behalf of whom a Contribution has been received by Licensor and
+   subsequently incorporated within the Work.
 
-1.3 "衍生作品"指基于本软件全部或部分内容所作的修改、翻译、汇编、重组，
-    以及将本软件与其他作品结合后形成的整体。
+2. Grant of Copyright License. Subject to the terms and conditions of
+   this License, each Contributor hereby grants to You a perpetual,
+   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   copyright license to reproduce, prepare Derivative Works of,
+   publicly display, publicly perform, sublicense, and distribute the
+   Work and such Derivative Works in Source or Object form.
 
-1.4 "商业用途"指直接或间接以获取经济利益为目的的使用，包括但不限于：
-    (a) 将本软件或其衍生作品的全部或部分集成进商业产品或商业服务并向
-        第三方提供；
-    (b) 在营利性实体的生产经营、客户交付、内部运营中作为生产工具使用；
-    (c) 以本软件或其衍生作品为基础，对外提供收费的托管、订阅、SaaS、
-        云服务或 API 服务；
-    (d) 销售、出租、许可、转让本软件或其衍生作品；
-    (e) 使用本软件或其衍生作品承接有偿的技术服务、咨询、培训、外包或
-        定制开发。
-    为个人学习、学术研究、教学演示、技术评估而使用，且不产生直接收入的，
-    不属于商业用途；非商业开源项目引用本软件，亦不属于商业用途，但该
-    项目本身不得用于上述任一情形。
+3. Grant of Patent License. Subject to the terms and conditions of
+   this License, each Contributor hereby grants to You a perpetual,
+   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   (except as stated in this section) patent license to make, have made,
+   use, offer to sell, sell, import, and otherwise transfer the Work,
+   where such license applies only to those patent claims licensable
+   by such Contributor that are necessarily infringed by their
+   Contribution(s) alone or by combination of their Contribution(s)
+   with the Work to which such Contribution(s) was submitted. If You
+   institute patent litigation against any entity (including a
+   cross-claim or counterclaim in a lawsuit) alleging that the Work
+   or a Contribution incorporated within the Work constitutes direct
+   or contributory patent infringement, then any patent licenses
+   granted to You under this License for that Work shall terminate
+   as of the date such litigation is filed.
 
-第二条　非商业使用授权
+4. Redistribution. You may reproduce and distribute copies of the
+   Work or Derivative Works thereof in any medium, with or without
+   modifications, and in Source or Object form, provided that You
+   meet the following conditions:
 
-2.1 在遵守本协议全部条款的前提下，著作权人授予你一项全球范围内、非独占、
-    免版税、不可转让的非商业使用许可，允许你：
-    (a) 复制、安装、运行本软件；
-    (b) 修改本软件并创作衍生作品；
-    (c) 分发本软件及其衍生作品。
+   (a) You must give any other recipients of the Work or
+       Derivative Works a copy of this License; and
 
-2.2 上述许可自你获得本软件之日起生效，至你违反本协议任何条款时自动终止。
+   (b) You must cause any modified files to carry prominent notices
+       stating that You changed the files; and
 
-第三条　使用条件
+   (c) You must retain, in the Source form of any Derivative Works
+       that You distribute, all copyright, patent, trademark, and
+       attribution notices from the Source form of the Work,
+       excluding those notices that do not pertain to any part of
+       the Derivative Works; and
 
-3.1 你必须在所有副本与衍生作品中完整保留本协议全文及原始版权声明，不得
-    删除、修改或遮蔽。
+   (d) If the Work includes a "NOTICE" text file as part of its
+       distribution, then any Derivative Works that You distribute must
+       include a readable copy of the attribution notices contained
+       within such NOTICE file, excluding those notices that do not
+       pertain to any part of the Derivative Works, in at least one
+       of the following places: within a NOTICE text file distributed
+       as part of the Derivative Works; within the Source form or
+       documentation, if provided along with the Derivative Works; or,
+       within a display generated by the Derivative Works, if and
+       wherever such third-party notices normally appear. The contents
+       of the NOTICE file are for informational purposes only and
+       do not modify the License. You may add Your own attribution
+       notices within Derivative Works that You distribute, alongside
+       or as an addendum to the NOTICE text from the Work, provided
+       that such additional attribution notices cannot be construed
+       as modifying the License.
 
-3.2 分发衍生作品时，你须在显著位置说明你作了修改，并注明修改日期。
+   You may add Your own copyright statement to Your modifications and
+   may provide additional or different license terms and conditions
+   for use, reproduction, or distribution of Your modifications, or
+   for any such Derivative Works as a whole, provided Your use,
+   reproduction, and distribution of the Work otherwise complies with
+   the conditions stated in this License.
 
-3.3 你不得以任何方式暗示著作权人对你或你的产品提供担保、背书或支持。
+5. Submission of Contributions. Unless You explicitly state otherwise,
+   any Contribution intentionally submitted for inclusion in the Work
+   by You to the Licensor shall be under the terms and conditions of
+   this License, without any additional terms or conditions.
+   Notwithstanding the above, nothing herein shall supersede or modify
+   the terms of any separate license agreement you may have executed
+   with Licensor regarding such Contributions.
 
-3.4 你不得使用本项目的名称、标识或作者名义为你自己的产品或服务作宣传，
-    除非事先取得书面许可。
+6. Trademarks. This License does not grant permission to use the trade
+   names, trademarks, service marks, or product names of the Licensor,
+   except as required for reasonable and customary use in describing the
+   origin of the Work and reproducing the content of the NOTICE file.
 
-第四条　商业用途的限制与授权
+7. Disclaimer of Warranty. Unless required by applicable law or
+   agreed to in writing, Licensor provides the Work (and each
+   Contributor provides its Contributions) on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+   implied, including, without limitation, any warranties or conditions
+   of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+   PARTICULAR PURPOSE. You are solely responsible for determining the
+   appropriateness of using or redistributing the Work and assume any
+   risks associated with Your exercise of permissions under this License.
 
-4.1 未经著作权人事先书面授权，你不得将本软件或其衍生作品用于任何商业
-    用途。本协议不授予任何商业使用权。
+8. Limitation of Liability. In no event and under no legal theory,
+   whether in tort (including negligence), contract, or otherwise,
+   unless required by applicable law (such as deliberate and grossly
+   negligent acts) or agreed to in writing, shall any Contributor be
+   liable to You for damages, including any direct, indirect, special,
+   incidental, or consequential damages of any character arising as a
+   result of this License or out of the use or inability to use the
+   Work (including but not limited to damages for loss of goodwill,
+   work stoppage, computer failure or malfunction, or any and all
+   other commercial damages or losses), even if such Contributor
+   has been advised of the possibility of such damages.
 
-4.2 商业授权须单独协商并签署书面许可协议。取得书面商业授权后，该书面
-    协议中与本协议冲突的部分，以书面协议为准。
+9. Accepting Warranty or Additional Liability. While redistributing
+   the Work or Derivative Works thereof, You may choose to offer,
+   and charge a fee for, acceptance of support, warranty, indemnity,
+   or other liability obligations and/or rights consistent with this
+   License. However, in accepting such obligations, You may act only
+   on Your own behalf and on Your sole responsibility, not on behalf
+   of any other Contributor, and only if You agree to indemnify,
+   defend, and hold each Contributor harmless for any liability
+   incurred by, or claims asserted against, such Contributor by reason
+   of your accepting any such warranty or additional liability.
 
-4.3 商业授权申请方式：在
-    https://github.com/windfancy/windpencilagent/issues
-    提交说明用途的 issue，或通过该仓库主页公布的其他联系方式与著作权人
-    取得联系。未收到明确书面同意前，视为未获授权。
+END OF TERMS AND CONDITIONS
 
-第五条　无担保
+APPENDIX: How to apply the Apache License to your work.
 
-本软件按"现状"提供，不附带任何明示或默示的担保，包括但不限于对适销性、
-特定用途适用性、权利完整性、不侵权的担保。你自行承担使用本软件的全部
-风险，包括但不限于数据丢失、系统损坏、业务中断及合规风险。
+   To apply the Apache License to your work, attach the following
+   boilerplate notice, with the fields enclosed by brackets "[]"
+   replaced with your own identifying information. (Don't include
+   the brackets!)  The text should be enclosed in the appropriate
+   comment syntax for the file format. We also recommend that a
+   file or class name and description of purpose be included on the
+   same "printed page" as the copyright notice for easier
+   identification within third-party archives.
 
-第六条　责任限制
+Copyright [yyyy] [name of copyright owner]
 
-在适用法律允许的最大范围内，著作权人不对因使用或无法使用本软件而产生的
-任何直接、间接、偶然、特殊、惩罚性或后果性损害承担责任，包括但不限于
-利润损失、数据损失、商誉损失或替代服务的采购成本，无论该等损害基于合同、
-侵权或其他任何理论，也无论著作权人是否已被告知该等损害的可能性。
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
 
-第七条　终止
+	http://www.apache.org/licenses/LICENSE-2.0
 
-7.1 你一旦违反本协议任何条款，本协议授予的全部许可立即自动终止，无需
-    另行通知。
-
-7.2 许可终止后，你须立即停止使用本软件，并销毁或删除你持有及分发的全部
-    副本与衍生作品。著作权人保留追究法律责任的权利。
-
-7.3 第五条、第六条、第八条在许可终止后继续有效。
-
-第八条　其他
-
-8.1 本协议适用中华人民共和国法律（不含冲突法规则）。
-
-8.2 因本协议产生的争议，双方应友好协商解决；协商不成的，提交著作权人
-    住所地有管辖权的人民法院诉讼解决。
-
-8.3 本协议任一条款被认定无效或不可执行，不影响其余条款的效力，该条款
-    应在最小必要范围内被调整以实现其原意。
-
-8.4 著作权人未行使本协议项下的任何权利，不构成对该权利的放弃。
-
-8.5 本协议构成双方就本软件使用达成的完整约定，取代此前一切口头或书面的
-    相关陈述。
-
-===============================================================================
-
-第三方依赖
-
-本软件依赖若干第三方开源组件，它们各自遵循自己的许可证（主要为 MIT /
-Apache-2.0）。本协议仅约束本项目自身包含的代码，不改变任何第三方组件的
-授权条件。完整依赖清单见 Cargo.lock。
-
-如需商业授权，请联系：https://github.com/windfancy/windpencilagent/issues
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
