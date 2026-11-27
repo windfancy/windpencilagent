@@ -589,7 +589,7 @@ pub fn cards() -> Vec<Card> {
                 f(
                     "scope.authorized",
                     "授权目标",
-                    "一行一个：IP / 域名 / CIDR / 路径前缀。空表示未声明 ⇒ fail-closed。",
+                    "一行一个：IP / 域名 / CIDR（如 10.0.0.5、example.com、10.0.0.0/24）。空表示未声明 ⇒ fail-closed。",
                     FieldKind::List,
                     ConfigSection::Scope,
                 ),
