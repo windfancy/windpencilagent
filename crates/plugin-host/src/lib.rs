@@ -10,9 +10,12 @@
 //!
 //! 组是逻辑视图：它的成员只是引用，同一个插件可被多个组引用而不复制文件。
 
+pub mod adopt;
 pub mod ctx;
 pub mod load;
 pub mod manifest;
+pub mod probe;
+pub mod relocate;
 pub mod scan;
 pub mod tool;
 
@@ -26,11 +29,50 @@ use std::sync::Arc;
 use plugin_abi::HostApi;
 use wpa_api::ApiTool;
 
+pub use adopt::{adopt_loose, ensure_group_dir, ensure_unassigned, AdoptReport};
 pub use ctx::CallContext;
 pub use load::{CacheConfig, LoadedPlugin, Loader};
 pub use manifest::{DllManifest, GroupManifest, PluginManifest};
+pub use probe::ProbeCache;
+pub use relocate::{relocate, retry_pending, Relocate};
 pub use scan::{GroupEntry, ScanReport};
 pub use tool::{max_risk, parse_risk, PluginTool};
+
+/// 启动前自举：收编 `plugins/` 根目录的裸 dll，刷新探测缓存。
+///
+/// 只做两件幂等的事，可以每次启动都跑：
+/// 1. `unassigned/` 目录与清单就位（不存在就建）；
+/// 2. 根下裸 dll / 放错层的插件目录搬进去，并按内嵌清单生成 `PnC.toml`。
+///
+/// `auto_probe = false` 时整段跳过 —— 有些人只想要"完全静态"的插件目录，
+/// 不愿意让宿主动任何文件（也会踩到"dll 被编译器占用"的毛病）。
+pub fn bootstrap(root: &std::path::Path, auto_probe: bool) -> AdoptReport {
+    if !root.is_dir() {
+        return AdoptReport::default();
+    }
+    let mut cache = ProbeCache::load(root);
+    let mut rep = if auto_probe {
+        adopt::adopt_loose(root, &mut cache, probe::DEFAULT_TIMEOUT)
+    } else {
+        // 不探测也要保证未分配目录在：否则「移出组」找不到落点
+        let mut r = AdoptReport::default();
+        if let Err(e) = adopt::ensure_unassigned(root) {
+            r.problems.push(e);
+        }
+        r
+    };
+    if auto_probe && !cache.is_empty() {
+        cache.save(root);
+    }
+    // 补做上次因 dll 被占用而挂起的换组搬迁。必须在这里（扫描之前）：
+    // 搬完目录本次扫描就能看见新归属，注册表对账一步收敛。
+    let (moved, mut problems) = relocate::retry_pending(root);
+    if moved > 0 {
+        rep.adopted.push(format!("{moved} 个挂起的换组已补做"));
+    }
+    rep.problems.append(&mut problems);
+    rep
+}
 
 /// 按插件声明的权限构造能力表（未声明的字段为 `None`）。
 pub type HostFactory = Arc<dyn Fn(&[String]) -> HostApi + Send + Sync>;
@@ -74,63 +116,38 @@ pub struct GroupStatus {
     pub members: Vec<PluginStatus>,
 }
 
-/// 状态文件（`state/plugins.toml`）。
-#[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
-struct PersistedState {
-    #[serde(default = "one")]
-    version: u32,
-    #[serde(default)]
-    enabled: Vec<String>,
-}
-
-fn one() -> u32 {
-    1
-}
-
 /// 插件宿主。
+///
+/// **不持有启用状态**：组/条目开不开由调用方（`wpa-engine` 的注册表）决定，
+/// 每次 `build_tools(&wanted)` 传入要加载的条目集合。历史上这里存过一份
+/// `plugins.toml` 的 `enabled`，与注册表的组开关形成两套账——UI 上关了组、
+/// 这里仍以为开着，实际加载与否取决于哪份文件先写。现在只有一份账。
 pub struct PluginHost {
     root: PathBuf,
-    state_path: PathBuf,
     factory: HostFactory,
     report: ScanReport,
     loader: Loader,
-    enabled: BTreeSet<String>,
-    /// 状态文件读写失败等（不致命，但要能看见）。
+    /// 扫描与加载过程中的非致命问题。
     problems: Vec<String>,
 }
 
 impl PluginHost {
-    /// 打开插件目录并加载状态。
-    ///
-    /// `state_path` 通常是 `<数据目录>/plugins.toml`；不存在时按各组的 `default_enabled` 初始化。
-    pub fn open(root: impl Into<PathBuf>, state_path: impl Into<PathBuf>, factory: HostFactory) -> Self {
+    /// 打开插件目录（只扫描，不加载任何 dll）。
+    pub fn open(root: impl Into<PathBuf>, factory: HostFactory) -> Self {
         let root = root.into();
-        let state_path = state_path.into();
         let report = scan::scan(&root);
-        let mut host = Self {
+        Self {
             root,
-            state_path,
             factory,
             report,
             loader: Loader::new(CacheConfig::default()),
-            enabled: BTreeSet::new(),
             problems: Vec::new(),
-        };
-        host.load_state();
-        host
+        }
     }
 
     /// 重新扫描（新增插件后调用；不影响已加载实例）。
     pub fn rescan(&mut self) {
         self.report = scan::scan(&self.root);
-        // 已启用的组若被删掉，从状态里剔除
-        let known: BTreeSet<String> = self
-            .report
-            .groups
-            .iter()
-            .map(|g| g.manifest.id.clone())
-            .collect();
-        self.enabled.retain(|g| known.contains(g));
     }
 
     pub fn root(&self) -> &Path {
@@ -151,14 +168,6 @@ impl PluginHost {
         &self.report.groups
     }
 
-    pub fn enabled_groups(&self) -> Vec<String> {
-        self.enabled.iter().cloned().collect()
-    }
-
-    pub fn is_enabled(&self, id: &str) -> bool {
-        self.enabled.contains(id)
-    }
-
     /// 组成员（按组内声明顺序）。
     pub fn members_of(&self, group: &str) -> Vec<PluginManifest> {
         self.report
@@ -167,40 +176,37 @@ impl PluginHost {
             .unwrap_or_default()
     }
 
-    /// 全部已启用组的成员（去重，保持组优先序）。
+    /// 全部组的成员（去重，保持组优先序）。
+    ///
+    /// 不再按"已启用"过滤：加载与否由 `build_tools(&wanted)` 的 `wanted` 决定，
+    /// 避免"扫描面"和"启用面"各算一遍、两边对不上。
     pub fn active_members(&self) -> Vec<(String, PluginManifest)> {
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
-        for gid in self.enabled_groups_in_order() {
-            if let Some(g) = self.report.group(&gid) {
-                for m in &g.members {
-                    if seen.insert(m.id.clone()) {
-                        out.push((gid.clone(), m.clone()));
-                    }
+        for g in &self.report.groups {
+            for m in &g.members {
+                if seen.insert(m.id.clone()) {
+                    out.push((g.manifest.id.clone(), m.clone()));
                 }
             }
         }
         out
     }
 
-    /// 已启用组，按 priority 排序。
-    pub fn enabled_groups_in_order(&self) -> Vec<String> {
-        let mut v: Vec<String> = self
-            .report
+    /// 扫描顺序下的组 id（`report` 已按 priority 排序）。
+    pub fn group_ids_in_order(&self) -> Vec<String> {
+        self.report
             .groups
             .iter()
-            .filter(|g| self.enabled.contains(&g.manifest.id))
             .map(|g| g.manifest.id.clone())
-            .collect();
-        // report 已按 priority 排序，这里保持
-        if v.is_empty() {
-            v = Vec::new();
-        }
-        v
+            .collect()
     }
 
-    /// 启用组（连带启用其依赖）。
-    pub fn enable(&mut self, id: &str) -> Result<Vec<String>, String> {
+    /// 校验"能否启用组"，返回需要连带启用的组（依赖闭包，已拓扑排序）。
+    ///
+    /// **不写任何状态**：组开关只存在于注册表（唯一账本），调用方拿到返回值后
+    /// 写注册表即可。这里只做"目录里有没有这个组 / 依赖是否齐全 / 有没有环"。
+    pub fn check_enable(&self, enabled: &BTreeSet<String>, id: &str) -> Result<Vec<String>, String> {
         if self.report.group(id).is_none() {
             return Err(format!("组 `{id}` 不存在（先运行一次扫描/检查目录名）"));
         }
@@ -225,57 +231,25 @@ impl PluginHost {
             .map(|k| (k.clone(), requires.get(k).cloned().unwrap_or_default()))
             .collect();
         let order = scan::topo_order(&sub)?;
-
-        let mut newly = Vec::new();
-        for g in order {
-            if self.enabled.insert(g.clone()) {
-                newly.push(g);
-            }
-        }
-        self.save_state();
-        Ok(newly)
+        // 已经启用的不必再报
+        Ok(order.into_iter().filter(|g| !enabled.contains(g)).collect())
     }
 
-    /// 禁用组（有其它已启用组依赖它时拒绝）。
-    pub fn disable(&mut self, id: &str) -> Result<(), String> {
-        if !self.enabled.contains(id) {
+    /// 校验"能否禁用组"：被别的已启用组依赖时拒绝。
+    pub fn check_disable(&self, enabled: &BTreeSet<String>, id: &str) -> Result<(), String> {
+        if !enabled.contains(id) {
             return Err(format!("组 `{id}` 未启用"));
         }
-        for g in self.enabled.clone() {
+        let requires = self.requires_map();
+        for g in enabled {
             if g == id {
                 continue;
             }
-            if let Some(deps) = self.requires_map().get(&g) {
-                if deps.iter().any(|d| d == id) {
-                    return Err(format!("组 `{g}` 依赖 `{id}`，先禁用 `{g}`"));
-                }
+            if requires.get(g).map(|d| d.iter().any(|x| x == id)).unwrap_or(false) {
+                return Err(format!("组 `{g}` 依赖 `{id}`，先禁用 `{g}`"));
             }
         }
-        self.enabled.remove(id);
-        // 卸载成员实例（可能被其他组共享：还在别的已启用组里就留着）
-        let still_used: BTreeSet<String> = self
-            .active_members()
-            .into_iter()
-            .map(|(_, m)| m.id)
-            .collect();
-        if let Some(g) = self.report.group(id) {
-            for m in &g.members {
-                if !still_used.contains(&m.id) {
-                    self.loader.unload(&m.id);
-                }
-            }
-        }
-        self.save_state();
         Ok(())
-    }
-
-    /// 启用/禁用切换。
-    pub fn toggle(&mut self, id: &str, on: bool) -> Result<(), String> {
-        if on {
-            self.enable(id).map(|_| ())
-        } else {
-            self.disable(id)
-        }
     }
 
     fn requires_map(&self) -> BTreeMap<String, Vec<String>> {
@@ -286,13 +260,19 @@ impl PluginHost {
             .collect()
     }
 
-    /// 构建已启用组的全部工具（首次调用时加载对应 dll）。
+    /// 构建 `wanted` 里列出的条目（首次调用时加载对应 dll）。
+    ///
+    /// `wanted` 是**条目 id 集合**（不是组）：注册表已经算好"装了 + 启用 + 组启用"，
+    /// 这里只负责把对应 dll 打开。这样"未安装的 dll 永远不会被 dlopen"。
     ///
     /// 返回 `(工具, 问题)`：单个插件加载失败只影响它自己。
-    pub fn build_tools(&self) -> (Vec<ToolWithGroup>, Vec<String>) {
+    pub fn build_tools(&self, wanted: &BTreeSet<String>) -> (Vec<ToolWithGroup>, Vec<String>) {
         let mut tools: Vec<ToolWithGroup> = Vec::new();
         let mut problems = Vec::new();
         for (gid, m) in self.active_members() {
+            if !wanted.contains(&m.id) {
+                continue;
+            }
             // 声明式清单：实现就是 PnC.toml 里的 [[tool]] + exec，不走 dll 加载
             if let Some(pnc) = &m.declarative {
                 for t in tree_core::exec::build_tools(&pnc.tool, &m.dir, gid.as_str(), None) {
@@ -335,7 +315,9 @@ impl PluginHost {
     }
 
     /// 组 + 成员聚合状态（UI 树包/插件页读这个）。
-    pub fn status(&self) -> Vec<GroupStatus> {
+    ///
+    /// `enabled` 由调用方传入（注册表里的组开关）——宿主不再自己记账。
+    pub fn status(&self, enabled: &BTreeSet<String>) -> Vec<GroupStatus> {
         self.report
             .groups
             .iter()
@@ -377,7 +359,7 @@ impl PluginHost {
                     priority: g.manifest.priority,
                     description: g.manifest.description.clone(),
                     requires: g.manifest.requires_groups.clone(),
-                    enabled: self.enabled.contains(&g.manifest.id),
+                    enabled: enabled.contains(&g.manifest.id),
                     members,
                 }
             })
@@ -392,72 +374,6 @@ impl PluginHost {
     /// 回收空闲实例。
     pub fn purge_idle(&self) -> Vec<String> {
         self.loader.purge_idle()
-    }
-
-    // ---- 状态持久化 ----
-
-    fn load_state(&mut self) {
-        let text = match std::fs::read_to_string(&self.state_path) {
-            Ok(t) => t,
-            Err(_) => {
-                // 首次运行：按组的 default_enabled 初始化
-                for g in &self.report.groups {
-                    if g.manifest.default_enabled {
-                        self.enabled.insert(g.manifest.id.clone());
-                    }
-                }
-                return;
-            }
-        };
-        match toml::from_str::<PersistedState>(&text) {
-            Ok(st) => {
-                for id in st.enabled {
-                    if self.report.group(&id).is_some() {
-                        self.enabled.insert(id);
-                    } else {
-                        self.problems
-                            .push(format!("状态文件里的组 `{id}` 已不存在，已忽略"));
-                    }
-                }
-            }
-            Err(e) => {
-                self.problems
-                    .push(format!("状态文件解析失败（按默认启用）：{e}"));
-                for g in &self.report.groups {
-                    if g.manifest.default_enabled {
-                        self.enabled.insert(g.manifest.id.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    fn save_state(&mut self) {
-        let st = PersistedState {
-            version: 1,
-            enabled: self.enabled.iter().cloned().collect(),
-        };
-        let text = match toml::to_string_pretty(&st) {
-            Ok(t) => t,
-            Err(e) => {
-                self.problems.push(format!("状态序列化失败：{e}"));
-                return;
-            }
-        };
-        if let Some(dir) = self.state_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                self.problems.push(format!("创建状态目录失败：{e}"));
-                return;
-            }
-        }
-        let tmp = self.state_path.with_extension("tmp");
-        if let Err(e) = std::fs::write(&tmp, text) {
-            self.problems.push(format!("写状态文件失败：{e}"));
-            return;
-        }
-        if let Err(e) = std::fs::rename(&tmp, &self.state_path) {
-            self.problems.push(format!("替换状态文件失败：{e}"));
-        }
     }
 }
 
@@ -501,71 +417,68 @@ mod tests {
             &plugins.join("a/x/PnC.toml"),
             "[plugin]\nid = \"x\"\npermissions = [\"http\"]\n",
         );
-        let host = PluginHost::open(&plugins, root.join("state/plugins.toml"), factory());
+        let host = PluginHost::open(&plugins, factory());
         (host, root)
     }
 
     #[test]
-    fn default_enabled_from_manifest() {
-        let (h, _r) = setup("default");
-        assert!(h.is_enabled("a"));
-        assert!(h.is_enabled("b"), "requires 不会自动启用，但 default_enabled 默认 true");
-        assert!(!h.is_enabled("c"));
+    fn scan_keeps_group_order() {
+        let (h, _r) = setup("order");
+        assert_eq!(h.group_ids_in_order(), vec!["a", "b", "c"], "按 priority 排序");
     }
 
     #[test]
-    fn enable_pulls_dependencies_in_topo_order() {
-        let (mut h, _r) = setup("enable");
-        h.disable("b").unwrap();
-        h.disable("a").unwrap();
-        assert!(!h.is_enabled("a"));
-        let newly = h.enable("b").unwrap();
-        assert_eq!(newly, vec!["a".to_string(), "b".to_string()], "依赖先启用");
-        assert!(h.is_enabled("a") && h.is_enabled("b"));
+    fn check_enable_pulls_dependencies_in_topo_order() {
+        let (h, _r) = setup("enable");
+        let mut on: BTreeSet<String> = BTreeSet::new();
+        let needed = h.check_enable(&on, "b").unwrap();
+        assert_eq!(needed, vec!["a".to_string(), "b".to_string()], "依赖先启用");
+        // 全部已开时不必再返回
+        on.extend(needed);
+        assert!(h.check_enable(&on, "b").unwrap().is_empty());
+        // 不存在的组 → 明确报错
+        assert!(h.check_enable(&on, "nope").unwrap_err().contains("不存在"));
     }
 
     #[test]
-    fn disable_blocked_by_dependent() {
-        let (mut h, _r) = setup("blocked");
-        h.enable("b").unwrap();
-        let err = h.disable("a").unwrap_err();
-        assert!(err.contains("\"b\"") || err.contains("b"), "{err}");
-        h.disable("b").unwrap();
-        h.disable("a").unwrap();
+    fn check_disable_blocked_by_dependent() {
+        let (h, _r) = setup("blocked");
+        let on: BTreeSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
+        let err = h.check_disable(&on, "a").unwrap_err();
+        assert!(err.contains('b'), "{err}");
+        // 没人依赖 b：可以禁
+        assert!(h.check_disable(&on, "b").is_ok());
+        // 没启用过的组：禁不了
+        assert!(h.check_disable(&BTreeSet::new(), "c").is_err());
     }
 
     #[test]
-    fn state_persists_across_reopen() {
-        let (mut h, root) = setup("persist");
-        h.disable("b").unwrap();
-        h.enable("c").unwrap();
-        drop(h);
-        let h2 = PluginHost::open(
-            root.join("plugins"),
-            root.join("state/plugins.toml"),
-            factory(),
-        );
-        assert!(!h2.is_enabled("b"));
-        assert!(h2.is_enabled("c"));
-        assert!(h2.is_enabled("a"));
-    }
+    fn build_tools_only_builds_wanted_entries() {
+        let (h, _r) = setup("wanted");
+        // 什么都不要求 → 不去碰 dll，也就不该报"缺 dll"
+        let (tools, problems) = h.build_tools(&BTreeSet::new());
+        assert!(tools.is_empty());
+        assert!(problems.is_empty(), "未要求的条目不该被加载：{problems:?}");
 
-    #[test]
-    fn build_tools_reports_missing_binary() {
-        let (h, _r) = setup("tools");
-        let (tools, problems) = h.build_tools();
-        assert!(tools.is_empty(), "没有 dll 就构建不出工具");
+        // 要求了但没 dll → 报缺文件
+        let wanted: BTreeSet<String> = ["x".to_string()].into_iter().collect();
+        let (tools, problems) = h.build_tools(&wanted);
+        assert!(tools.is_empty());
         assert!(problems.iter().any(|p| p.contains("缺 dll")), "{problems:?}");
     }
 
     #[test]
     fn status_shape() {
         let (h, _r) = setup("status");
-        let st = h.status();
+        let on: BTreeSet<String> = ["a".to_string()].into_iter().collect();
+        let st = h.status(&on);
         assert_eq!(st.len(), 3);
         let a = st.iter().find(|g| g.id == "a").unwrap();
         assert_eq!(a.members.len(), 1);
         assert!(a.members[0].state == PluginState::Installed);
         assert!(a.members[0].risk == "low");
+        assert!(a.enabled, "启用状态来自调用方传入的集合");
+        let b = st.iter().find(|g| g.id == "b").unwrap();
+        assert!(!b.enabled);
     }
 }

@@ -416,6 +416,11 @@ fn run_inner(config_path: PathBuf) -> anyhow::Result<()> {
         let h = handle.tx.clone();
         app.on_session_open(move |id| { let _ = h.send(Cmd::SessionOpen(id.to_string())); });
     }
+    // 会话预览：只读拉取消息，不动当前对话
+    {
+        let h = handle.tx.clone();
+        app.on_preview_session(move |id| { let _ = h.send(Cmd::SessionView(id.to_string())); });
+    }
     {
         let h = handle.tx.clone();
         app.on_session_delete(move |id| { let _ = h.send(Cmd::SessionDelete(id.to_string())); });
@@ -461,6 +466,84 @@ fn run_inner(config_path: PathBuf) -> anyhow::Result<()> {
     {
         let h = handle.tx.clone();
         app.on_knowledge_remove(move |name| { let _ = h.send(Cmd::KnowledgeRemove(name.to_string())); });
+    }
+    // 领域私有外部工具：加 exe / 加声明式目录 / 移除
+    //
+    // 「加」要弹文件/目录选择器。选择器必须在 UI 线程弹（模态对话框属于窗口系统），
+    // 而落盘在引擎线程。所以这里选完路径再发命令，使用说明从 UI 属性里取。
+    {
+        let h = handle.tx.clone();
+        let weak = app.as_weak();
+        app.on_ext_add_exe(move || {
+            let Some(app) = weak.upgrade() else { return };
+            let picked = crate::native_dialog::pick_file(
+                "选择要登记的外部程序",
+                Some("可执行文件\0*.exe\0所有文件\0*.*\0\0"),
+            );
+            let Some(path) = picked else { return };
+            let usage = app.get_ext_usage().to_string();
+            let _ = h.send(Cmd::DomainExtAdd {
+                kind: "exe".to_string(),
+                path,
+                usage,
+            });
+        });
+    }
+    {
+        let h = handle.tx.clone();
+        let weak = app.as_weak();
+        app.on_ext_add_dir(move || {
+            let Some(app) = weak.upgrade() else { return };
+            // 目录里要有 PnC.toml 才算声明式插件；选错由引擎报错并 toast
+            let picked = crate::native_dialog::pick_dir("选择声明式插件目录（含 PnC.toml）");
+            let Some(path) = picked else { return };
+            let usage = app.get_ext_usage().to_string();
+            let _ = h.send(Cmd::DomainExtAdd {
+                kind: "declarative".to_string(),
+                path,
+                usage,
+            });
+        });
+    }
+    {
+        let h = handle.tx.clone();
+        app.on_ext_remove(move |i| {
+            let _ = h.send(Cmd::DomainExtRemove(i as usize));
+        });
+    }
+    // 领域概要保存：读 UI 里的当前文本（TextEdit 绑定在 root.dom-summary 上）
+    {
+        let h = handle.tx.clone();
+        let weak = app.as_weak();
+        app.on_save_summary(move |id, summary| {
+            let text = weak
+                .upgrade()
+                .map(|a| a.get_dom_summary().to_string())
+                .unwrap_or_else(|| summary.to_string());
+            let _ = h.send(Cmd::DomainSummarySave { id: id.to_string(), summary: text });
+        });
+    }
+    // 概要字数：Slint 的 string 没有 length，编辑/切领域时由 UI 线程算好下发
+    {
+        let weak = app.as_weak();
+        app.on_summary_edited(move || {
+            if let Some(a) = weak.upgrade() {
+                let n = a.get_dom_summary().chars().count() as i32;
+                a.set_dom_summary_len(n);
+            }
+        });
+    }
+    // AI 生成领域配置（用编辑框当前文本；空了才回落到已保存的概要）
+    {
+        let h = handle.tx.clone();
+        let weak = app.as_weak();
+        app.on_ai_generate(move |id| {
+            let summary = weak
+                .upgrade()
+                .map(|a| a.get_dom_summary().to_string())
+                .unwrap_or_default();
+            let _ = h.send(Cmd::DomainAiGenerate { id: id.to_string(), summary });
+        });
     }
     // 配置路径浏览（#13.1/#16）：UI 线程同步弹原生对话框，选到的路径走 SetField
     {

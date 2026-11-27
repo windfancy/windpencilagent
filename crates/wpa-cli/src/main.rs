@@ -758,7 +758,7 @@ enum RegOp {
 }
 
 fn registry_file(cfg: &AppConfig) -> PathBuf {
-    wpa_engine::registry::domain_registry_path(&cfg.data_root(), &cfg.domain.active)
+    wpa_engine::registry::registry_path(&cfg.data_root())
 }
 
 fn registry_list(cfg: &AppConfig) -> anyhow::Result<()> {
@@ -767,7 +767,7 @@ fn registry_list(cfg: &AppConfig) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     // 先扫一遍 manifests：list 要能看到"磁盘上有但还没安装"的候选
     let (snap, scan_problems) = wpa_engine::registry::scan_plugins(&cfg.plugins_root());
-    let merged = reg.merge_scan(&snap);
+    let merged = reg.reconcile(&snap);
     if !merged.is_empty() {
         reg.save(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
@@ -782,11 +782,29 @@ fn registry_list(cfg: &AppConfig) -> anyhow::Result<()> {
     for p in &scan_problems {
         println!("  清单告警：{p}");
     }
+    // 候选 = 扫描到但注册表里没有（账本只记已安装）
+    let candidates: Vec<_> = snap
+        .groups
+        .iter()
+        .flat_map(|g| g.entries.iter().map(move |e| (g, e)))
+        .filter(|(_, e)| reg.entry(&e.id).is_none())
+        .collect();
     let st = reg.stats();
     println!(
-        "组 {}/{} 启用 · 条目 {}（可用 {} / 缺文件 {} / 未安装 {}）",
-        st.groups_enabled, st.groups, st.entries, st.ok, st.broken, st.discovered
+        "组 {}/{} 启用 · 已装 {}（可用 {} / 缺文件 {}）· 未安装 {}",
+        st.groups_enabled,
+        st.groups,
+        st.entries,
+        st.ok,
+        st.broken,
+        candidates.len()
     );
+    if !candidates.is_empty() {
+        println!("\n未安装（扫描候选，需 registry install 后才可用）：");
+        for (g, e) in &candidates {
+            println!("  · {:<24} 组 {:<14} {}", e.id, g.id, e.name);
+        }
+    }
     for g in &reg.groups {
         let on = if g.enabled { "启用" } else { "停用" };
         let live = g.entries.iter().filter(|e| e.active(g.enabled)).count();
@@ -836,7 +854,7 @@ fn registry_move(cfg: &AppConfig, tool: &str, group: &str) -> anyhow::Result<()>
     let (mut reg, _) =
         wpa_engine::registry::ToolRegistry::load_or_init(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
     let (snap, _) = wpa_engine::registry::scan_plugins(&cfg.plugins_root());
-    reg.merge_scan(&snap);
+    reg.reconcile(&snap);
     match reg.move_entry(tool, group) {
         Some((from, to)) if from == to => {
             println!("{tool} 已经在组 {to} 里，无需移动");
@@ -847,7 +865,9 @@ fn registry_move(cfg: &AppConfig, tool: &str, group: &str) -> anyhow::Result<()>
             println!("{tool}：{from} → {to}（下次装配生效）");
             Ok(())
         }
-        None => anyhow::bail!("注册表里没有条目 `{tool}`"),
+        None => anyhow::bail!(
+            "注册表里没有已安装的条目 `{tool}`（内置工具不能换组；未安装的先 registry install）"
+        ),
     }
 }
 
@@ -855,27 +875,36 @@ fn registry_act(cfg: &AppConfig, id: &str, op: RegOp) -> anyhow::Result<()> {
     let path = registry_file(cfg);
     let (mut reg, _) =
         wpa_engine::registry::ToolRegistry::load_or_init(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
-    // 操作前先合并一次扫描：新放到磁盘上的插件组要先变成"候选"才能安装
+    // 操作前先对账一次：已装条目的 ok/broken 要反映磁盘现状
     let (snap, _) = wpa_engine::registry::scan_plugins(&cfg.plugins_root());
-    reg.merge_scan(&snap);
+    reg.reconcile(&snap);
 
-    // 先按组 id 找，再按条目 id 找
-    let is_group = reg.group(id).is_some();
-    let is_entry = reg.entry(id).is_some();
+    // "存在"有三种：注册表里的组、注册表里的已装条目、扫描到的候选
+    let candidate = snap
+        .groups
+        .iter()
+        .flat_map(|g| g.entries.iter().map(move |e| (g, e)))
+        .find(|(_, e)| e.id == id);
+    let is_group = reg.group(id).is_some() || snap.groups.iter().any(|g| g.id == id);
+    let is_entry = reg.entry(id).is_some() || candidate.is_some();
     if !is_group && !is_entry {
-        anyhow::bail!("注册表里没有 `{id}`（组或条目都不匹配）");
+        anyhow::bail!("注册表与扫描结果里都没有 `{id}`");
     }
 
     let msg = match (op, is_group) {
         (RegOp::Install, true) => {
-            let n = reg.install_group(id);
+            let n = reg.install_group_from(id, &snap);
             format!("组 {id} 已安装：{n} 个条目")
         }
         (RegOp::Install, false) => {
-            if reg.set_entry_enabled(id, true) {
-                format!("条目 {id} 已启用")
+            if reg.is_installed(id) {
+                format!("条目 {id} 已安装")
+            } else if let Some((g, e)) = candidate {
+                reg.install_candidate(&g.id, &g.source, e)
+                    .map_err(|x| anyhow::anyhow!("{x}"))?;
+                format!("条目 {id} 已安装（组 {}）", g.id)
             } else {
-                format!("条目 {id} 状态未变化（可能需要先安装所在组）")
+                format!("找不到条目 {id}（也不在扫描候选里）")
             }
         }
         (RegOp::Uninstall, true) => {

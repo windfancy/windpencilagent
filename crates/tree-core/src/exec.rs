@@ -264,7 +264,30 @@ impl DeclarativeTool {
             }
 
             ExecSpec::Command { program, args: argv, stdin } => {
-                let mut cmd = tokio::process::Command::new(program);
+                // 相对路径按「本包目录」解析，而不是按进程 CWD。
+                //
+                // 不这么做的话，`path = "./bin/tool.exe"` 这种写法只在"恰好从包目录
+                // 启动进程"时能跑（桌面端从安装目录启动，必然跑不起来）。而 PATH
+                // 上的 `python` / `git` 这类命令名在包目录里找不到同名文件，仍然
+                // 原样交给系统解析——两种意图都保住。
+                let exe = Path::new(program);
+                let resolved = if exe.is_absolute() {
+                    exe.to_path_buf()
+                } else if program.contains("..") {
+                    // 领域私有的外部程序只许在领域目录内，`..` 一律拒绝
+                    return ToolReply::err(
+                        format!("外部程序路径非法（不能含 `..`）：{program}"),
+                        ms(),
+                    );
+                } else {
+                    let cand = self.base_dir.join(exe);
+                    if cand.is_file() {
+                        cand
+                    } else {
+                        exe.to_path_buf()
+                    }
+                };
+                let mut cmd = tokio::process::Command::new(&resolved);
                 for a in argv {
                     match self.expand(a, args) {
                         Ok(v) => {
@@ -282,7 +305,12 @@ impl DeclarativeTool {
                 cmd.stderr(std::process::Stdio::piped());
                 let mut child = match cmd.spawn() {
                     Ok(c) => c,
-                    Err(e) => return ToolReply::err(format!("启动失败 {program}：{e}"), ms()),
+                    Err(e) => {
+                        return ToolReply::err(
+                            format!("启动失败 {}：{e}", resolved.display()),
+                            ms(),
+                        )
+                    }
                 };
                 if let Some(input) = stdin {
                     // stdin 与 args 一样支持 {{name}} 模板：缺参数要报错而不是原样下发

@@ -237,6 +237,11 @@ pub struct PluginsSection {
     pub timeout_ms: u64,
     /// 一次装载最多加载多少个实例（LRU 上限）。
     pub max_cached: usize,
+    /// 启动时自动收编 `plugins/` 根目录下的裸 dll（读到内嵌清单 → 建档 → 移入未分配）。
+    ///
+    /// 关掉后宿主完全不碰插件目录内容（只读扫描照旧）：适合"目录由外部脚本管理、
+    /// 不许程序改文件"的场景。默认开——这是零手写发现链路的入口。
+    pub auto_probe: bool,
 }
 
 impl Default for PluginsSection {
@@ -246,6 +251,7 @@ impl Default for PluginsSection {
             enabled: true,
             timeout_ms: 120_000,
             max_cached: 32,
+            auto_probe: true,
         }
     }
 }
@@ -1090,7 +1096,11 @@ impl AppConfig {
         direct
     }
 
-    /// 插件状态文件（`<data>/plugins.toml`）。
+    /// 旧插件状态文件（`<data>/plugins.toml`）。
+    ///
+    /// **已退役**：组启用状态只存在于全局注册表 `<data>/registry.toml`。
+    /// 保留这个路径只为了两件事：迁移时识别旧文件、需要时提示用户"可以删了"。
+    /// 新代码不要读写它——两套账正是"UI 关了组、插件还在加载"的根因。
     pub fn plugins_state_path(&self) -> PathBuf {
         self.data_root().join("plugins.toml")
     }
@@ -1210,6 +1220,7 @@ extract_every = 5
 enabled = true
 timeout_ms = 120000
 max_cached = 32
+auto_probe = true          # 启动时把 plugins/ 根目录的裸 dll 收编进「未分配」
 
 [tree]
 # 单文件树清单（兼容保留）；新项目用 [domain] 表达领域

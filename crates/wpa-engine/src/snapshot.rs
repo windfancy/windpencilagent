@@ -81,6 +81,10 @@ pub struct DomainCardRow {
     /// 该领域最终装配出来的工具数（0 且 groups 非空 = 组名写错了）
     pub tools: usize,
     pub knowledge_entries: usize,
+    /// 知识库只读清单（`domain.toml` 的 `[[kb]]`，类型/位置/用途/条目数）
+    pub kb: Vec<crate::domain::KbRow>,
+    /// 领域私有外部工具清单（`domain.toml` 的 `[[external]]`）
+    pub external: Vec<crate::domain::ExternalRow>,
     pub has_workflow: bool,
     pub active: bool,
     /// 装载失败原因（空 = 正常）
@@ -142,12 +146,12 @@ pub struct RegGroupRow {
 /// `core` / `sandbox` / `shell` / `space` / `memory` 这 5 组是基座内置基础能力，
 /// 由基座自己管理，不进插件工具管理界面；其余组（含「未分配」）都归 UI 管理。
 pub fn is_managed_group(id: &str) -> bool {
-    !matches!(id, "core" | "sandbox" | "shell" | "space" | "memory")
+    !matches!(id, "core" | "sandbox" | "shell" | "space" | "memory" | "kb")
 }
 
 /// 是否为保留的「未分配」组。
 pub fn is_unassigned(id: &str) -> bool {
-    id == "__unassigned__"
+    id == crate::registry::UNASSIGNED_GROUP
 }
 
 /// 注册表里的一个条目（能力页中栏）。
@@ -162,6 +166,8 @@ pub struct RegEntryRow {
     pub status: String,
     pub enabled: bool,
     pub installed: bool,
+    /// 未安装但文件齐备 → 可点"安装"（候选行为 true，已装行为 false）
+    pub installable: bool,
     /// 组是否启用（决定它最终生不生效）
     pub group_enabled: bool,
     pub note: String,
@@ -225,20 +231,21 @@ mod tests {
     }
 
     #[test]
-    fn managed_group_excludes_five_builtin_base_groups() {
-        for id in ["core", "sandbox", "shell", "space", "memory"] {
+    fn managed_group_excludes_builtin_base_groups() {
+        for id in ["core", "sandbox", "shell", "space", "memory", "kb"] {
             assert!(!is_managed_group(id), "{id} 是内置基础能力组，不应进插件管理 UI");
         }
         assert!(is_managed_group("file"));
         assert!(is_managed_group("net"));
         assert!(is_managed_group("text"));
         assert!(is_managed_group("my_plugin"));
-        assert!(is_managed_group("__unassigned__"), "未分配组也归管理 UI 使用");
+        assert!(is_managed_group(crate::registry::UNASSIGNED_GROUP), "未分配组也归管理 UI 使用");
     }
 
     #[test]
     fn is_unassigned_only_matches_reserved_id() {
-        assert!(is_unassigned("__unassigned__"));
+        assert!(is_unassigned(crate::registry::UNASSIGNED_GROUP));
+        assert!(!is_unassigned("__unassigned__"), "旧 id 已迁移，不再视为未分配");
         assert!(!is_unassigned("core"));
         assert!(!is_unassigned("未分配"));
         assert!(!is_unassigned(""));

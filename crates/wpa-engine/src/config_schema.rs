@@ -636,6 +636,14 @@ pub fn cards() -> Vec<Card> {
                     FieldKind::Int { min: 1, max: 128, step: 1 },
                     ConfigSection::Plugin,
                 ),
+                f(
+                    "plugins.auto_probe",
+                    "自动收编裸 dll",
+                    "启动时把 plugins/ 根目录下的 dll 读清单、建档并移入「未分配」组。\
+                     关掉后程序不再改插件目录（只读扫描照旧）。",
+                    FieldKind::Bool,
+                    ConfigSection::Plugin,
+                ),
             ],
         },
         Card {
@@ -876,6 +884,7 @@ impl AppConfig {
             "plugins.dir" => self.plugins.dir.clone().unwrap_or_default(),
             "plugins.timeout_ms" => self.plugins.timeout_ms.to_string(),
             "plugins.max_cached" => self.plugins.max_cached.to_string(),
+            "plugins.auto_probe" => self.plugins.auto_probe.to_string(),
             "logging.level" => self.logging.level.clone(),
             "logging.dir" => self.logging.dir.clone().unwrap_or_default(),
             "logging.keep_days" => self.logging.keep_days.to_string(),
@@ -1014,6 +1023,7 @@ impl AppConfig {
             "plugins.dir" => self.plugins.dir = opt_text(v),
             "plugins.timeout_ms" => self.plugins.timeout_ms = uint(v)?,
             "plugins.max_cached" => self.plugins.max_cached = usize_(v)?,
+            "plugins.auto_probe" => self.plugins.auto_probe = parse_bool(v)?,
             "logging.level" => self.logging.level = v.to_string(),
             "logging.dir" => self.logging.dir = opt_text(v),
             "logging.keep_days" => self.logging.keep_days = uint(v)? as u32,

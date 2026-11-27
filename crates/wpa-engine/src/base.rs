@@ -62,6 +62,8 @@ pub struct Base {
     pub provider_cell: agent_core::subagent::ProviderCell,
     /// 会话库（逐轮落盘 + 跨会话检索；None = 打不开，记忆层降级）。
     pub sessions: Option<Arc<base_store::SessionStore>>,
+    /// 向量库使用的 embedding 档案槽（模型切换后由上层刷新，调用时读最新值）。
+    pub embedder: Arc<crate::embedder::SharedEmbedder>,
 }
 
 impl Base {
@@ -94,7 +96,9 @@ impl<'a> Reg<'a> {
     }
 
     fn add(&mut self, name: &str, tool: Arc<dyn toolkit_core::tools::Tool>) -> anyhow::Result<()> {
-        if !self.reg.is_active(name) {
+        // 双闸门：账本里必须"已安装"，且组/条目开关都开着。
+        // 单看 is_active 不够——它对"查不到"默认放行（运行时工具的口子）。
+        if !self.reg.is_installed(name) || !self.reg.is_active(name) {
             self.skipped.push(name.to_string());
             return Ok(());
         }
@@ -111,6 +115,7 @@ fn register_base_tools(
     shells: &Arc<ShellSessions>,
     jobs: &Arc<JobStore>,
     reg: &crate::registry::ToolRegistry,
+    embedder: Arc<crate::embedder::SharedEmbedder>,
 ) -> anyhow::Result<()> {
     let restricted = cfg.sandbox.restricted_token;
     let mut r = Reg::new(kern, reg);
@@ -151,6 +156,12 @@ fn register_base_tools(
     }
     // 文本原语（编解码 / 哈希 / 正则 / 线索提取 / 变换）
     for t in text_core::tools::all() {
+        let n = t.name().to_string();
+        r.add(&n, t)?;
+    }
+    // 知识读写（kb）：本地 sqlite + 向量库。基础组，任何领域都可用，
+    // 因此不参与领域装配；向量写入/检索时读共享 embedding 槽（没有模型就报错）。
+    for t in data_core::tools::all(cfg.data_root(), Some(embedder as Arc<dyn data_core::vector::Embedder>)) {
         let n = t.name().to_string();
         r.add(&n, t)?;
     }
@@ -208,17 +219,29 @@ pub async fn assemble(cfg: &AppConfig, _cli_tree: Option<PathBuf>) -> anyhow::Re
     let jobs = JobStore::new();
     let mut warnings = Vec::new();
 
-    // 注册表（领域独立）：能力的唯一真相源。切换领域即加载该领域自己的账本，
-    // 组开关/装卸状态互不干扰；default 领域兼容旧全局 registry.toml。
-    // 首次运行按 `catalog::BUILTIN_SPECS` 生成（内置工具全部 installed+enabled）。
+    // 注册表：**全局唯一**，与领域无关。它是「组 ⇄ 插件」的管理树，
+    // 组启用/插件装卸都是全局状态；领域只在 `domain.toml` 里引用组 id。
+    // 装配顺序：先做一次旧账本合并（幂等，无旧目录时零开销），再加载。
     let data_root = cfg.data_root();
-    let reg_path = crate::registry::domain_registry_path(&data_root, &cfg.domain.active);
+    let reg_path = crate::registry::registry_path(&data_root);
+    match crate::registry::consolidate(&data_root) {
+        Ok(rep) if !rep.is_empty() => {
+            tracing::info!(report = %rep.describe(), "旧领域账本已合并进全局注册表");
+            if let Some(p) = &rep.archived {
+                tracing::info!(path = %p.display(), "旧账本目录已归档");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => warnings.push(format!("旧注册表合并失败（已跳过，按全局账本继续）：{e}")),
+    }
     let (mut tool_reg, reg_created) = crate::registry::ToolRegistry::load_or_init(&reg_path)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if reg_created {
         tracing::info!(path = %reg_path.display(), "已按内置工具生成注册表");
     }
-    register_base_tools(&kern, cfg, &workspaces, &shells, &jobs, &tool_reg)?;
+    // 向量库的 embedding 档案槽：模型切换时由上层刷新，不重新装配工具也能生效
+    let embedder = crate::embedder::SharedEmbedder::new(cfg);
+    register_base_tools(&kern, cfg, &workspaces, &shells, &jobs, &tool_reg, embedder.clone())?;
 
     // 执行器只需 kern，提前建好，规划层/协作层注册时要用
     let executor: Arc<dyn ToolExecutor> = Arc::new(ToolkitExecutor::new(kern.clone()));
@@ -304,35 +327,58 @@ pub async fn assemble(cfg: &AppConfig, _cli_tree: Option<PathBuf>) -> anyhow::Re
     let mut plugin_host: Option<plugin_host::PluginHost> = None;
     let plugins_root = cfg.plugins_root();
     if plugins_root.is_dir() {
+        // 自举：先把 `plugins/` 根下的裸 dll 收编进 `unassigned/`，再扫描。
+        // 顺序不能反——扫描只读、只认目录，裸文件在根目录下永远不会成为候选。
+        let boot = plugin_host::bootstrap(&plugins_root, cfg.plugins.auto_probe);
+        if !boot.adopted.is_empty() {
+            tracing::info!(report = %boot.describe(), "已收编 plugins 根目录的裸插件");
+        }
+        for p in &boot.problems {
+            warnings.push(format!("插件自举：{p}"));
+        }
         let env = Arc::new(crate::plugin_rt::PluginEnv::new(
             tokio::runtime::Handle::current(),
             data_root.clone(),
         ));
         plugin_host = Some(plugin_host::PluginHost::open(
             &plugins_root,
-            &cfg.plugins_state_path(),
             crate::plugin_rt::factory(env),
         ));
     }
 
     if let Some(ref host) = plugin_host {
-        // 扫描结果并入注册表：新条目 → discovered，缺文件 → broken。
-        // 合并只更新"事实"，installed/enabled 是用户的账，不归扫描管。
+        // 对账：只更新已安装条目的状态（ok / broken），**不新增**。
+        // 候选不落库——它们只在快照里可见，用户点"安装"才进注册表。
         let snap = crate::registry::snapshot_from_groups(host.groups());
-        let rep = tool_reg.merge_scan(&snap);
+        let rep = tool_reg.reconcile(&snap);
         if !rep.is_empty() {
-            tracing::info!(report = %rep.describe(), "注册表已合并扫描结果");
+            tracing::info!(report = %rep.describe(), "注册表已与扫描结果对账");
             if let Err(e) = tool_reg.save(&reg_path) {
                 warnings.push(format!("注册表保存失败：{e}"));
             }
         }
-        let (ptools, pproblems) = host.build_tools();
+        // 只有「装了 + 条目启用 + 组启用」的条目才允许被 dlopen。
+        // 这是硬闸门：未安装的 dll 连库都不会被打开（不是加载后再拒）。
+        let wanted: std::collections::BTreeSet<String> = tool_reg
+            .groups
+            .iter()
+            .filter(|g| g.enabled)
+            .flat_map(|g| {
+                g.entries
+                    .iter()
+                    .filter(|e| e.active(true))
+                    .map(|e| e.id.clone())
+            })
+            .collect();
+        let (ptools, pproblems) = host.build_tools(&wanted);
         for p in &pproblems {
             warnings.push(p.clone());
         }
         for (gid, t) in ptools {
             let name = t.name().to_string();
-            if !tool_reg.is_active(&name) {
+            // `is_active` 对"注册表里查不到"的默认放行（为运行时工具留的口子），
+            // 未安装的插件同样查不到 ⇒ 必须再用 is_installed 兜一道。
+            if !tool_reg.is_installed(&name) || !tool_reg.is_active(&name) {
                 tracing::info!(tool = %name, "注册表未安装/未启用，跳过插件工具");
                 continue;
             }
@@ -400,6 +446,29 @@ pub async fn assemble(cfg: &AppConfig, _cli_tree: Option<PathBuf>) -> anyhow::Re
                 knowledge = p.knowledge_entries,
                 "领域已装载"
             );
+            // 领域**私有**外部工具：只在这个领域生效，不进 plugins/、不进全局注册表、
+            // 不出现在能力页。领域切换 = 这批工具跟着换掉。
+            let invoker: Option<Arc<dyn tree_core::exec::PrimitiveInvoker>> =
+                Some(Arc::new(crate::tools::KernPrimitiveInvoker::new(kern.clone(), session_id)));
+            let (ext_tools, ext_problems) =
+                crate::domain::external_tools(&p.dir, &p.external, &p.manifest.id, invoker);
+            let ext_group = format!("ext:{}", p.manifest.id);
+            for t in &ext_tools {
+                // 用独立群组登记：不挤占任何已引用组，也便于 UI 区分来源
+                if let Err(e) = api.register_tool_in(t.clone(), Some(&ext_group)) {
+                    warnings.push(format!("领域外部工具 {} 注册失败：{e}", t.name()));
+                }
+            }
+            if !ext_tools.is_empty() {
+                tracing::info!(
+                    domain = %p.manifest.id,
+                    count = ext_tools.len(),
+                    "领域外部工具已注册"
+                );
+            }
+            for w in ext_problems {
+                warnings.push(w);
+            }
             domain_pack = Some(Arc::new(p));
         }
     }
@@ -478,6 +547,7 @@ pub async fn assemble(cfg: &AppConfig, _cli_tree: Option<PathBuf>) -> anyhow::Re
         plan,
         provider_cell,
         sessions,
+        embedder,
     })
 }
 
@@ -611,10 +681,20 @@ pub fn build_session(base: &Base, opts: SessionOpts) -> (ChatSession, SessionInf
             }
         }
     }
-    let allow: Vec<String> = match &active {
+    let mut allow: Vec<String> = match &active {
         Some(ws) => ws.effective_tools(&group_map, &all_names),
         None => all_names.clone(),
     };
+    // 基础组（core/shell/sandbox/space/memory/kb）永远可用。
+    // 空间白名单只决定"额外"放行哪些可配置组，不能因为没勾就把基座的运行前提砍掉
+    // ——那样用户会得到一个"记忆、知识检索凭空消失"的系统，且从界面上看不出原因。
+    for name in &all_names {
+        if let Some(g) = tool_group.get(name) {
+            if crate::catalog::is_base_group(g) && !allow.contains(name) {
+                allow.push(name.clone());
+            }
+        }
+    }
     for name in &allow {
         if !all_names.contains(name) {
             warnings.push(format!("空间白名单引用了不存在的组或工具：{name}"));
@@ -628,7 +708,9 @@ pub fn build_session(base: &Base, opts: SessionOpts) -> (ChatSession, SessionInf
 
     // 5.5) 领域工具面：`domain.toml` 的 `groups` 声明「这个领域要用哪些组」。
     //
-    // 三条硬规则（顺序执行，且必须都满足才"可见"）：
+    // 四条硬规则（顺序执行，且必须都满足才"可见"）：
+    //   0. **基础组永远保留**（core/shell/sandbox/space/memory/kb）。它们是基座的
+    //      运行前提，不参与领域装配——用户在 `groups` 里写不写都不影响。
     //   1. 智能体层工具（plan.* / subagent.spawn）永不受领域约束 —— 它们由
     //      [agent] 分区控制。让领域能关掉规划层，等于埋一个"计划消失"的坑。
     //   2. 能判定归属、且组不在声明里 ⇒ 剔除。这是领域收敛的本意。
@@ -643,6 +725,10 @@ pub fn build_session(base: &Base, opts: SessionOpts) -> (ChatSession, SessionInf
         // 声明了但一个工具都不对应 ⇒ 多半是写错了组名，必须报出来
         let known: Vec<String> = base.kern.tools();
         for g in declared {
+            if crate::catalog::is_base_group(g) {
+                // 基础组不需要声明（旧文件里还写着也照常工作，只是不再生效）
+                continue;
+            }
             let hits = known
                 .iter()
                 .filter(|t| tool_group.get(*t).map(|x| x == g).unwrap_or(false))
@@ -665,6 +751,8 @@ pub fn build_session(base: &Base, opts: SessionOpts) -> (ChatSession, SessionInf
                     return false;
                 }
                 match tool_group.get(&s.name) {
+                    // 基础组：不论领域是否声明都保留
+                    Some(g) if crate::catalog::is_base_group(g) => true,
                     Some(g) if !declared.contains(g) => {
                         hidden_by_domain += 1;
                         false
@@ -1066,6 +1154,8 @@ impl Base {
                         groups: d.group_ids,
                         tools,
                         knowledge_entries: d.knowledge_entries,
+                        kb: d.kb,
+                        external: d.external,
                         has_workflow: d.has_workflow,
                         active: d.active,
                         error: d.error.unwrap_or_default(),
@@ -1073,7 +1163,7 @@ impl Base {
                 })
                 .collect();
 
-        // 能力页：8 个基座组永远列出来（含 0 工具、被领域收敛掉的），
+        // 能力页：基座组永远列出来（含 0 工具、被领域收敛掉的），
         // 否则用户看到"组 0 个"会以为基座没能力，其实只是本模式没有契约群组。
         let declared: Vec<String> = self
             .domain
@@ -1087,17 +1177,22 @@ impl Base {
                 label: g.label.to_string(),
                 source: g.source.to_string(),
                 tools: tools.iter().filter(|t| t.group == g.id).count(),
-                // 无领域（纯基座模式）= 不做收敛，全部组都算声明
-                declared: declared.is_empty() || declared.iter().any(|d| d == g.id),
+                // 基础组（core/shell/sandbox/space/memory/kb）装配层无条件保留，
+                // 所以它们**永远算已生效**——写成"被领域收敛"会误导用户去 domain.toml 里找开关。
+                // 其余组：无领域（纯基座模式）= 不做收敛，全部算声明。
+                declared: crate::catalog::is_base_group(g.id)
+                    || declared.is_empty()
+                    || declared.iter().any(|d| d == g.id),
             })
             .collect();
 
-        // 能力页（注册表视图）：组与条目都来自 data/registry.toml，插件也在里面。
+        // 能力页（注册表视图）：组与条目来自全局 `data/registry.toml`（只记已安装），
+        // 再把扫描候选合并进来（未安装、文件齐备 → 可点"安装"）。
         // 与上面的 cap_groups 不同——那是"基座有哪些能力组"（静态），这里才是"装了什么"。
         let (reg_groups, reg_entries, reg_summary) = {
             let reg = self.registry.read().unwrap_or_else(|e| e.into_inner());
             let st = reg.stats();
-            let groups = reg
+            let mut groups = reg
                 .groups
                 .iter()
                 .map(|g| crate::snapshot::RegGroupRow {
@@ -1109,13 +1204,10 @@ impl Base {
                     total: g.entries.len(),
                     active: g.entries.iter().filter(|e| e.active(g.enabled)).count(),
                     broken: g.entries.iter().filter(|e| e.status == "broken").count(),
-                    discovered: g.entries
-                        .iter()
-                        .filter(|e| e.status == "discovered")
-                        .count(),
+                    discovered: 0,
                 })
                 .collect::<Vec<_>>();
-            let entries = reg
+            let mut entries = reg
                 .groups
                 .iter()
                 .flat_map(|g| {
@@ -1128,15 +1220,80 @@ impl Base {
                         status: e.status.clone(),
                         enabled: e.enabled,
                         installed: e.installed,
+                        installable: false,
                         group_enabled: g.enabled,
                         note: e.note.clone(),
                         capabilities: e.capabilities.clone(),
                     })
                 })
                 .collect::<Vec<_>>();
+
+            // 扫描候选：只展示，不落库。用户点"安装"才进注册表。
+            let mut candidates = 0usize;
+            if let Some(h) = self.plugins.as_ref() {
+                for sg in h.groups() {
+                    let gid = sg.manifest.id.clone();
+                    let missing: Vec<_> = sg
+                        .members
+                        .iter()
+                        .filter(|m| reg.entry(&m.id).is_none())
+                        .collect();
+                    if groups.iter().all(|x| x.id != gid) {
+                        groups.push(crate::snapshot::RegGroupRow {
+                            id: gid.clone(),
+                            label: if sg.manifest.name.is_empty() {
+                                gid.clone()
+                            } else {
+                                sg.manifest.name.clone()
+                            },
+                            description: sg.manifest.description.clone(),
+                            source: "plugin".to_string(),
+                            enabled: false,
+                            total: sg.members.len(),
+                            active: 0,
+                            broken: missing.iter().filter(|m| !m.has_binary()).count(),
+                            discovered: missing.len(),
+                        });
+                    } else if let Some(row) = groups.iter_mut().find(|x| x.id == gid) {
+                        // 已存在的组（如内置 file 组里也放了插件）：补上候选计数
+                        row.discovered = missing.len();
+                    }
+                    for m in missing {
+                        let has_file = m.has_binary();
+                        candidates += 1;
+                        entries.push(crate::snapshot::RegEntryRow {
+                            id: m.id.clone(),
+                            group: gid.clone(),
+                            name: m.name.clone(),
+                            source: if m.declarative.is_some() {
+                                "declarative".to_string()
+                            } else {
+                                "plugin".to_string()
+                            },
+                            risk: m.risk.clone(),
+                            status: if has_file { "discovered" } else { "broken" }.to_string(),
+                            enabled: false,
+                            installed: false,
+                            installable: has_file,
+                            group_enabled: false,
+                            note: if has_file {
+                                "自动发现，尚未安装".to_string()
+                            } else {
+                                format!("缺 dll：{}", m.dll_path().display())
+                            },
+                            capabilities: if m.capabilities.is_empty() {
+                                m.tags.clone()
+                            } else {
+                                m.capabilities.clone()
+                            },
+                        });
+                    }
+                }
+            }
+
             let summary = format!(
-                "组 {}/{} 启用 · 条目 {}（可用 {} · 缺文件 {} · 未安装 {}）",
-                st.groups_enabled, st.groups, st.entries, st.ok, st.broken, st.discovered
+                "组 {}/{} 启用 · 已装 {}（可用 {} · 缺文件 {}）· 未安装 {}",
+                st.groups_enabled, st.groups, st.entries, st.ok, st.broken, candidates
             );
             (groups, entries, summary)
         };

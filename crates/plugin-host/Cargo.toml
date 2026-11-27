@@ -16,3 +16,8 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
+
+[[bin]]
+name = "pnc-probe"
+path = "src/bin/pnc_probe.rs"
+required-features = []

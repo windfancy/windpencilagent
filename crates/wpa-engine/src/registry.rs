@@ -34,7 +34,72 @@ pub const REGISTRY_VERSION: u32 = 1;
 ///
 /// 这是保留组：不能新建、改名、删除，也不能直接安装其中的条目——
 /// 必须先由用户分配到具体组。它始终存在，且固定在列表末尾。
-pub const UNASSIGNED_GROUP: &str = "__unassigned__";
+///
+/// ## 为什么 id 不带下划线
+///
+/// 它同时是磁盘上的目录名（`plugins/unassigned/`）。`plugin_host::scan` 会跳过
+/// `.`／`_` 开头的目录（那是"用户自己放的共享库/素材"的约定俗成），所以历史上
+/// `__unassigned__` 这个 id 永远对不上一个真目录：往里面放 dll 会被静默忽略。
+/// 改成一个普通名字后，id、目录名、`PnC.toml` 三者一致，扫描链路才闭合。
+///
+/// 旧数据由 [`ToolRegistry::migrate_ids`] 一次性改名。
+pub const UNASSIGNED_GROUP: &str = "unassigned";
+
+/// 未分配的旧 id（`migrate_ids` 用）。
+const LEGACY_UNASSIGNED: &str = "__unassigned__";
+
+/// 从用户输入的名称派生一个**可当目录名**的组 id。
+///
+/// 用户只该输入组名（「我的抓包工具」），不该被要求手敲 id——那违反易用性铁律。
+/// 中文名派生不出有意义的 ASCII，退化成 `grp`（再由 [`unique_group_id`] 加序号）。
+pub fn slug_group_id(name: &str) -> String {
+    let mut out = String::new();
+    let mut prev_sep = false;
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_sep = false;
+        } else if !prev_sep && !out.is_empty() {
+            out.push('_');
+            prev_sep = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    // 目录名太长在 Windows 上会撞 260 上限（插件目录本身还可能嵌套），截短
+    if out.len() > 24 {
+        out.truncate(24);
+        while out.ends_with('_') {
+            out.pop();
+        }
+    }
+    if out.is_empty() {
+        out.push_str("grp");
+    }
+    // 纯数字开头容易和"编号目录"混淆，加前缀让它一眼看出是个组
+    if out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert_str(0, "grp_");
+    }
+    out
+}
+
+/// 在已有组与基础组之外求一个不冲突的组 id。
+pub fn unique_group_id(base: &str, taken: impl Fn(&str) -> bool) -> String {
+    let free = |cand: &str| {
+        !taken(cand) && !catalog::is_base_group(cand) && cand != UNASSIGNED_GROUP
+    };
+    if free(base) {
+        return base.to_string();
+    }
+    for n in 2..1000 {
+        let cand = format!("{base}_{n}");
+        if free(&cand) {
+            return cand;
+        }
+    }
+    format!("{base}_x")
+}
 
 /// 条目状态。
 pub mod status {
@@ -167,9 +232,18 @@ impl ToolRegistry {
             }
             let mut reg: Self = toml::from_str(&text)
                 .map_err(|e| format!("注册表解析失败 {}：{e}", path.display()))?;
-            // 版本升级时补齐新增的内置工具（不覆盖用户对已有条目的改动）
-            let created = reg.ensure_builtins();
-            if created {
+            // 内置条目先归位（内置工具不允许换组），再补齐版本升级新增的。
+            // 顺序不能反：先 rehome 能把用户挪走的副本（连同 enabled 设置）收回来，
+            // 若先 ensure 会在原组补一份默认值，用户的开关就丢了。
+            let mut changed = reg.migrate_ids();
+            changed |= reg.rehome_builtins();
+            changed |= reg.ensure_builtins();
+            // 旧版扫描会把候选（installed=false）写进账本；新语义下账本只记已安装，
+            // 候选由扫描快照重建。这里把残留剔掉，否则能力页会出现"幽灵条目"。
+            if reg.drop_uninstalled() > 0 {
+                changed = true;
+            }
+            if changed {
                 reg.save(path)?;
             }
             return Ok((reg, false));
@@ -177,6 +251,21 @@ impl ToolRegistry {
         let reg = Self::from_catalog();
         reg.save(path)?;
         Ok((reg, true))
+    }
+
+    /// 旧 id 改名：`__unassigned__` → [`UNASSIGNED_GROUP`]。返回是否有改动。
+    ///
+    /// 只在语义变更时用一次。它必须跑在 `ensure_builtins` 之前——否则后者会
+    /// 看到"没有未分配组"而补一个新的，旧组连同里面的条目原地变成孤儿。
+    pub fn migrate_ids(&mut self) -> bool {
+        let mut changed = false;
+        for g in &mut self.groups {
+            if g.id == LEGACY_UNASSIGNED {
+                g.id = UNASSIGNED_GROUP.to_string();
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// 按 `catalog::CAP_GROUPS` + `BUILTIN_SPECS` 生成初始注册表。
@@ -240,6 +329,74 @@ impl ToolRegistry {
             changed = true;
         }
         changed
+    }
+
+    /// 把被移出原组的内置条目归位。返回是否有改动。
+    ///
+    /// 内置工具**不允许换组**：它的所属组由 `catalog::BUILTIN_SPECS` 决定，是代码契约，
+    /// 不是用户资产。而 `ensure_builtins` 是按 `spec.group` 补缺的——一旦用户把它挪到
+    /// 别的组，加载时原组会再补一份，同一个 id 就出现在两个组（能力页两行、装配口径
+    /// 按组名取第一个，全部对不上）。所以加载时必须先收回复本再补缺。
+    ///
+    /// 收回时**保留条目本身的 `enabled`**（用户禁用了某个内置工具，归位后仍然禁用）。
+    pub fn rehome_builtins(&mut self) -> bool {
+        let mut changed = false;
+        for spec in catalog::BUILTIN_SPECS {
+            // 收走所有"不在目标组"的同名内置副本（通常只会有 1 份，多份时留第一份）
+            let mut carried: Option<EntryRecord> = None;
+            for gi in 0..self.groups.len() {
+                if self.groups[gi].id == spec.group {
+                    continue;
+                }
+                let mut ei = 0;
+                while ei < self.groups[gi].entries.len() {
+                    let hit = self.groups[gi].entries[ei].id == spec.name
+                        && self.groups[gi].entries[ei].source == source::BUILTIN;
+                    if hit {
+                        let e = self.groups[gi].entries.remove(ei);
+                        if carried.is_none() {
+                            carried = Some(e);
+                        }
+                        changed = true;
+                    } else {
+                        ei += 1;
+                    }
+                }
+            }
+            let Some(c) = carried else { continue };
+            match self.groups.iter_mut().find(|g| g.id == spec.group) {
+                Some(g) => {
+                    // 目标组里已有同名条目：说明是重复副本，直接丢弃（已在上面移除来源）
+                    if !g.entries.iter().any(|e| e.id == spec.name) {
+                        g.entries.push(c);
+                    }
+                }
+                None => {
+                    // 目标组整个被删掉了：重建组并把条目放回
+                    self.groups.push(GroupRecord {
+                        id: spec.group.to_string(),
+                        name: catalog::label_of(spec.group).to_string(),
+                        description: String::new(),
+                        kind: "tools".to_string(),
+                        source: source::BUILTIN.to_string(),
+                        enabled: true,
+                        entries: vec![c],
+                    });
+                }
+            }
+        }
+        changed
+    }
+
+    /// 剔除 `installed == false` 的非内置条目（旧版残留的候选）。返回剔除数。
+    pub fn drop_uninstalled(&mut self) -> usize {
+        let mut n = 0;
+        for g in &mut self.groups {
+            let before = g.entries.len();
+            g.entries.retain(|e| e.installed || e.source == source::BUILTIN);
+            n += before - g.entries.len();
+        }
+        n
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
@@ -350,6 +507,14 @@ impl ToolRegistry {
         if id == UNASSIGNED_GROUP {
             return Err("「未分配」是保留组，不能删除".to_string());
         }
+        // 内置组（core / file / net / …）由 catalog 定义，删了下次 load 会被
+        // `ensure_builtins` 重建，而组内内置条目会先被搬进「未分配」——
+        // 结果是"组回来了、工具却留在隔离区"。直接拒绝，别留这个坑。
+        if self.group(id).map(|g| g.source == source::BUILTIN).unwrap_or(false) {
+            return Err(format!(
+                "组「{id}」是内置组（由基座提供），不能删除；不需要时在能力页关掉它的启用开关"
+            ));
+        }
         let tools: Vec<String> = self
             .group(id)
             .ok_or_else(|| format!("组「{id}」不存在"))?
@@ -434,166 +599,104 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// 卸载单个条目：回到 `discovered`，`enabled = false`，条目保留在原组。
+    /// 卸载单个条目：**从注册表删除**（注册表只记已安装）。
     ///
-    /// 已卸载时幂等返回 Ok；条目不存在时给中文错误。
+    /// 删掉之后它会重新出现在"扫描候选"里（UI 中栏仍可见，状态"未安装"），
+    /// 所以用户不会觉得"东西丢了"，但账本里确实没有它了。
+    ///
+    /// 内置条目不能卸载（由代码提供）：不需要时用 `set_entry_enabled(false)`。
     pub fn uninstall_entry(&mut self, tool: &str) -> Result<(), String> {
-        for g in &mut self.groups {
-            if let Some(e) = g.entries.iter_mut().find(|e| e.id == tool) {
-                if !e.installed {
-                    return Ok(());
-                }
-                e.installed = false;
-                e.status = status::DISCOVERED.to_string();
-                e.enabled = false;
-                return Ok(());
+        for gi in 0..self.groups.len() {
+            let Some(ei) = self.groups[gi].entries.iter().position(|e| e.id == tool) else {
+                continue;
+            };
+            if self.groups[gi].entries[ei].source == source::BUILTIN {
+                return Err(format!(
+                    "「{tool}」是内置工具，不能卸载；不需要时改成禁用"
+                ));
             }
+            self.groups[gi].entries.remove(ei);
+            return Ok(());
         }
         Err(format!("条目「{tool}」不存在"))
     }
 
-    /// 安装一个组：把该组的候选条目全部转为已安装。
+    /// 卸载一个组：删除组内所有**非内置**条目（内置工具固定属于内置组）。
     ///
-    /// 只对 `discovered` 生效——`broken` 的条目要等文件补回来（重新扫描后变 discovered/ok）。
-    /// 返回实际安装的条目数。
-    pub fn install_group(&mut self, id: &str) -> usize {
-        let Some(g) = self.group_mut(id) else { return 0 };
-        let mut n = 0;
-        for e in &mut g.entries {
-            if !e.installed && e.status == status::DISCOVERED {
-                e.installed = true;
-                // 安装即启用：用户点"安装"的期望是"能用了"，之后可单独关某条
-                e.enabled = true;
-                e.status = status::OK.to_string();
-                n += 1;
-            }
-        }
-        if n > 0 {
-            g.enabled = true;
-        }
-        n
-    }
-
-    /// 卸载一个组：条目全部转为未安装（条目本身保留，便于重新安装）。
-    ///
-    /// **不动 `enabled`**：卸载再安装应该回到原来"哪些开着"的状态，
-    /// 而不是把用户之前的选择一起抹掉。
+    /// 组本身保留（可能还有内置条目，或用户想重新装回同一个组）。
+    /// 返回删除的条目数。
     pub fn uninstall_group(&mut self, id: &str) -> usize {
         let Some(g) = self.group_mut(id) else { return 0 };
-        let mut n = 0;
-        for e in &mut g.entries {
-            if e.installed {
-                e.installed = false;
-                if e.status == status::OK {
-                    e.status = status::DISCOVERED.to_string();
-                }
-                n += 1;
-            }
+        let before = g.entries.len();
+        g.entries.retain(|e| e.source == source::BUILTIN);
+        let n = before - g.entries.len();
+        if n > 0 {
+            g.enabled = false;
         }
-        g.enabled = false;
         n
     }
 
-    /// 与扫描结果合并：**扫描只更新状态，不改变用户的安装/启停决定**。
+    /// 注册表里有没有「已安装」的记录。
     ///
-    /// - 扫描到 + 注册表有 + 文件在 ⇒ `ok`
-    /// - 扫描到 + 注册表有 + 文件缺 ⇒ `broken`
-    /// - 扫描到 + 注册表无 ⇒ 新组/新条目，`installed=false, status=discovered`
-    /// - 注册表有（非内置）+ 扫描不到 ⇒ `broken`（条目保留，不消失）
-    pub fn merge_scan(&mut self, snap: &ScanSnapshot) -> MergeReport {
+    /// 插件装配的**硬闸门**：`is_active` 对"查不到"的条目默认放行（为 `session.search`
+    /// / `plan.*` 这类运行时工具留的口子），未安装的插件同样查不到，所以不能只靠它。
+    pub fn is_installed(&self, tool: &str) -> bool {
+        self.entry(tool).map(|(_, e)| e.installed).unwrap_or(false)
+    }
+
+    /// 与扫描结果对账：**只更新已安装条目的事实状态，从不新增、从不删除**。
+    ///
+    /// 这是「注册表只记已安装」的核心。扫描到的候选不落库——它们留在内存快照里
+    /// （`snapshot` 把候选合并进 UI 行），用户点「安装」时才由
+    /// [`install_candidate`](Self::install_candidate) 落成正式条目。
+    ///
+    /// - 已安装 + 扫到 + 文件在 ⇒ `ok`
+    /// - 已安装 + 扫到 + 文件缺 ⇒ `broken`
+    /// - 已安装 + 没扫到 ⇒ `broken`（条目保留，留证据）
+    /// - 内置条目：跳过（由 catalog 管，不归扫描）
+    pub fn reconcile(&mut self, snap: &ScanSnapshot) -> MergeReport {
         let mut report = MergeReport::default();
         // 只看条目 id（不分组）：用户可能已经把条目移到别的组，
-        // 按"扫描组 + 条目"配对会把移动结果覆盖掉，等于移动功能失效。
+        // 按"扫描组 + 条目"配对会把移动结果覆盖掉。
         let mut seen: Vec<String> = Vec::new();
 
         for sg in &snap.groups {
-            let gi = match self.groups.iter().position(|g| g.id == sg.id) {
-                Some(i) => i,
-                None => {
-                    self.groups.push(GroupRecord {
-                        id: sg.id.clone(),
-                        name: sg.name.clone(),
-                        description: String::new(),
-                        kind: sg.kind.clone(),
-                        source: if sg.source.is_empty() {
-                            source::PLUGIN.to_string()
-                        } else {
-                            sg.source.clone()
-                        },
-                        enabled: false, // 新发现的组默认不启用，要用户显式安装
-                        entries: Vec::new(),
-                    });
-                    report.new_groups += 1;
-                    self.groups.len() - 1
-                }
-            };
-
             for se in &sg.entries {
                 seen.push(se.id.clone());
 
                 // 全局查找（跨组）：找到就更新事实位，**不改组归属**
-                let found = self.groups.iter().enumerate().find_map(|(gi2, g)| {
+                let found = self.groups.iter().enumerate().find_map(|(gi, g)| {
                     g.entries
                         .iter()
                         .position(|e| e.id == se.id)
-                        .map(|ei| (gi2, ei))
+                        .map(|ei| (gi, ei))
                 });
-
-                match found {
-                    Some((gi2, ei2)) => {
-                        let e = &mut self.groups[gi2].entries[ei2];
-                        e.name = se.name.clone();
-                        e.risk = se.risk.clone();
-                        e.path = se.path.clone();
-                        if !se.capabilities.is_empty() {
-                            e.capabilities = se.capabilities.clone();
-                        }
-                        if se.has_file {
-                            if e.installed && e.status == status::BROKEN {
-                                report.recovered += 1;
-                                e.note.clear();
-                            }
-                            if e.installed {
-                                e.status = status::OK.to_string();
-                            }
-                        } else {
-                            e.status = status::BROKEN.to_string();
-                            e.note = if se.note.is_empty() {
-                                "文件缺失".to_string()
-                            } else {
-                                se.note.clone()
-                            };
-                            report.broken += 1;
-                        }
+                // 没找到 = 候选：不落库，等用户安装
+                let Some((gi2, ei2)) = found else { continue };
+                let e = &mut self.groups[gi2].entries[ei2];
+                if e.source == source::BUILTIN {
+                    continue;
+                }
+                e.name = se.name.clone();
+                e.risk = se.risk.clone();
+                e.path = se.path.clone();
+                if !se.capabilities.is_empty() {
+                    e.capabilities = se.capabilities.clone();
+                }
+                if se.has_file {
+                    if e.status == status::BROKEN {
+                        report.recovered += 1;
+                        e.note.clear();
                     }
-                    None => {
-                        let has_file = se.has_file;
-                        let mut e = EntryRecord {
-                            id: se.id.clone(),
-                            name: se.name.clone(),
-                            source: source::PLUGIN.to_string(),
-                            path: se.path.clone(),
-                            risk: se.risk.clone(),
-                            capabilities: se.capabilities.clone(),
-                            installed: false,
-                            enabled: false,
-                            status: if has_file {
-                                status::DISCOVERED.to_string()
-                            } else {
-                                status::BROKEN.to_string()
-                            },
-                            note: if has_file {
-                                se.note.clone()
-                            } else {
-                                "文件缺失".to_string()
-                            },
-                        };
-                        if !has_file {
-                            e.note = "文件缺失".to_string();
-                        }
-                        self.groups[gi].entries.push(e);
-                        report.new_entries += 1;
-                    }
+                    e.status = status::OK.to_string();
+                } else {
+                    e.status = status::BROKEN.to_string();
+                    e.note = if se.note.is_empty() {
+                        "文件缺失".to_string()
+                    } else {
+                        se.note.clone()
+                    };
+                    report.broken += 1;
                 }
             }
         }
@@ -615,6 +718,89 @@ impl ToolRegistry {
         report
     }
 
+    /// 把扫描候选落成正式条目。
+    ///
+    /// 注册表里没有候选（只记已安装），所以候选数据必须由调用方从扫描快照传进来。
+    /// `group` 是目标组；`source_kind` 取 `plugin` / `declarative`。
+    ///
+    /// 装进「未分配」时落成"已安装但未启用"——它可以被移动，但不能直接跑。
+    pub fn install_candidate(
+        &mut self,
+        group: &str,
+        source_kind: &str,
+        se: &ScannedEntry,
+    ) -> Result<(), String> {
+        if let Some((g, _)) = self.entry(&se.id) {
+            return Err(format!(
+                "「{}」已经装在组「{}」里了（同一工具只能属于一个组）",
+                se.id, g.id
+            ));
+        }
+        if !se.has_file {
+            return Err(if se.note.is_empty() {
+                "文件缺失，无法安装".to_string()
+            } else {
+                format!("文件缺失，无法安装：{}", se.note)
+            });
+        }
+        let src = if source_kind.is_empty() {
+            source::PLUGIN.to_string()
+        } else {
+            source_kind.to_string()
+        };
+        let gi = match self.groups.iter().position(|g| g.id == group) {
+            Some(i) => i,
+            None => {
+                self.groups.push(GroupRecord {
+                    id: group.to_string(),
+                    name: group.to_string(),
+                    description: String::new(),
+                    kind: "tools".to_string(),
+                    source: src.clone(),
+                    enabled: true,
+                    entries: Vec::new(),
+                });
+                self.groups.len() - 1
+            }
+        };
+        let enabled = self.groups[gi].id != UNASSIGNED_GROUP;
+        self.groups[gi].entries.push(EntryRecord {
+            id: se.id.clone(),
+            name: se.name.clone(),
+            source: src,
+            path: se.path.clone(),
+            risk: se.risk.clone(),
+            capabilities: se.capabilities.clone(),
+            installed: true,
+            enabled,
+            status: status::OK.to_string(),
+            note: String::new(),
+        });
+        Ok(())
+    }
+
+    /// 批量安装某组里扫描到的候选（跳过已装的）。返回实际安装数。
+    pub fn install_group_from(&mut self, id: &str, snap: &ScanSnapshot) -> usize {
+        let Some(sg) = snap.groups.iter().find(|g| g.id == id) else {
+            return 0;
+        };
+        let mut n = 0;
+        for se in &sg.entries {
+            if self.entry(&se.id).is_some() {
+                continue;
+            }
+            if self.install_candidate(id, &sg.source, se).is_ok() {
+                n += 1;
+            }
+        }
+        if n > 0 {
+            if let Some(g) = self.group_mut(id) {
+                g.enabled = true;
+            }
+        }
+        n
+    }
+
     /// 把条目移到另一个组（组↔条目绑定）。返回 `(from, to)`。
     ///
     /// 目标组不存在时新建（source 跟随条目来源）。移动**不改**条目的
@@ -624,6 +810,11 @@ impl ToolRegistry {
             g.entries.iter().position(|e| e.id == tool).map(|ei| (gi, ei))
         })?;
         let from = self.groups[from_idx].id.clone();
+        // 内置工具属于固定组：既不能换组，也不能被移进「未分配」。
+        // 同组 passthrough 放行，避免调用方把"原地不动"当成错误。
+        if from != to_group && self.groups[from_idx].entries[ent_idx].source == source::BUILTIN {
+            return None;
+        }
         let entry = self.groups[from_idx].entries.remove(ent_idx);
         // 同一工具只允许存在于一个组：除当前这条外，把别处的同名条目一并清掉
         for g in &mut self.groups {
@@ -666,11 +857,18 @@ impl ToolRegistry {
         if self.group(group).is_none() {
             return Err(format!("目标组「{group}」不存在"));
         }
-        let installed = self
-            .entry(tool)
-            .ok_or_else(|| format!("条目「{tool}」不存在"))?
-            .1
-            .installed;
+        // 先判来源：内置工具换组要给"不能换"的明确原因，而不是笼统地报"条目不存在"
+        let (from_id, is_builtin, installed) = {
+            let (g, e) = self
+                .entry(tool)
+                .ok_or_else(|| format!("条目「{tool}」不存在"))?;
+            (g.id.clone(), e.source == source::BUILTIN, e.installed)
+        };
+        if is_builtin && from_id != group {
+            return Err(format!(
+                "「{tool}」是内置工具，固定属于组「{from_id}」，不能换组"
+            ));
+        }
 
         self.move_entry(tool, group)
             .ok_or_else(|| format!("条目「{tool}」不存在"))?;
@@ -848,22 +1046,219 @@ pub fn snapshot_from_groups(groups: &[plugin_host::GroupEntry]) -> ScanSnapshot 
     out
 }
 
-/// 注册表默认落点：`<data>/registry.toml`。
+/// 确保 `plugins/<id>/` 与其中的 `PnC.toml` 存在（转发插件宿主，UI 只需要这一个入口）。
+///
+/// 新建组时调用：用户只输入组名，目录和清单都是自动的——否则"建了组却往里放不了
+/// dll"（目录不存在），或者"目录在但扫描看不见"（缺清单）。
+pub fn ensure_group_dir(
+    root: &Path,
+    id: &str,
+    name: &str,
+    description: &str,
+) -> Result<PathBuf, String> {
+    plugin_host::ensure_group_dir(root, id, name, description)
+}
+
+/// 换组的**文件侧**：把 `plugins/<旧组>/<插件>/` 搬到目标组，返回给 UI 的一句话。
+///
+/// 账与盘必须一起动。只改账的话，扫描仍按目录判定归属，加载器拿到的还是旧路径——
+/// 表现为"换了组但工具照旧、卸载时找不到文件"。搬不动（dll 被占用）时本函数
+/// 会登记 `.pending-moves.json`，下次启动由 `bootstrap` 补做，返回的说明里会写明。
+pub fn relocate_plugin(root: &Path, tool: &str, to_group: &str) -> String {
+    if !root.is_dir() {
+        return String::new();
+    }
+    let report = plugin_host::scan::scan(root);
+    plugin_host::relocate(root, &report, tool, to_group).note()
+}
+
+/// 注册表落点：`<data>/registry.toml`。
+///
+/// **唯一一份，全局共享**。注册表是「组 ⇄ 插件」的管理树，与领域无关：
+/// 组和插件的装/卸/开关是全局状态，领域只**引用**组（`domain.toml` 的 `groups`）。
+///
+/// 历史：旧版曾按领域分账（`<data>/registries/<domain>/registry.toml`），
+/// 导致"领域 A 装的插件在领域 B 看不见 / 没装却在跑"。旧账本由
+/// [`consolidate`] 一次性合并进这里，之后不再读那套目录。
 pub fn registry_path(data_root: &Path) -> PathBuf {
     data_root.join("registry.toml")
 }
 
-/// 领域独立注册表路径。
+/// 账本合并结果（`consolidate` 的产物，供启动日志与 UI 提示用）。
+#[derive(Debug, Clone, Default)]
+pub struct ConsolidateReport {
+    /// 合并了哪些旧账本（目录名）。
+    pub ledgers: Vec<String>,
+    /// 从旧账本里整组带进来的组 id。
+    pub groups_added: Vec<String>,
+    /// 与全局已有组合并的组 id。
+    pub groups_merged: Vec<String>,
+    /// 状态冲突（同名组在两处开关不一致）的说明。
+    pub conflicts: Vec<String>,
+    /// 旧目录归档到哪里（`registries.migrated-<ts>`）。
+    pub archived: Option<PathBuf>,
+}
+
+impl ConsolidateReport {
+    pub fn is_empty(&self) -> bool {
+        self.ledgers.is_empty()
+    }
+
+    pub fn describe(&self) -> String {
+        if self.is_empty() {
+            return String::new();
+        }
+        let mut s = format!(
+            "已合并 {} 份旧领域账本 → 全局注册表（新增组 {} · 合并组 {}）",
+            self.ledgers.len(),
+            self.groups_added.len(),
+            self.groups_merged.len()
+        );
+        if !self.conflicts.is_empty() {
+            s.push_str(&format!("；{} 处状态冲突按「任一启用即启用」处理", self.conflicts.len()));
+        }
+        s
+    }
+}
+
+/// 把旧版「每领域一份」的注册表合并进全局账本，并归档旧目录。
 ///
-/// 背景：旧版只有一份全局 `<data>/registry.toml`，切换领域时所有组开关/装卸状态
-/// 共用同一份账本，导致"领域 A 关掉的组在领域 B 也关着"。改为每个领域一份
-/// `<data>/registries/<domain_id>/registry.toml`，切换领域 = 装配时加载对应账本。
+/// 幂等：`<data>/registries/` 不存在就什么都不做（合并后被改名，不会重复跑）。
 ///
-/// 兼容：`default` 领域（含空 id）继续用旧全局 `registry.toml`，老用户配置不丢。
-pub fn domain_registry_path(data_root: &Path, domain_id: &str) -> PathBuf {
-    match domain_id.trim() {
-        "" | "default" => registry_path(data_root),
-        id => data_root.join("registries").join(id).join("registry.toml"),
+/// 冲突裁决（宁可多启用一次，也不静默卸载）：
+/// - 组 `enabled`：任一处启用即启用
+/// - 条目 `installed` / `enabled`：任一为真即为真
+/// - 条目 `status`：取健康度最高的一档（ok > discovered > broken）
+pub fn consolidate(data_root: &Path) -> Result<ConsolidateReport, String> {
+    let mut rep = ConsolidateReport::default();
+    let reg_dir = data_root.join("registries");
+    if !reg_dir.is_dir() {
+        return Ok(rep);
+    }
+
+    // 收集旧账本：<registries>/<domain>/registry.toml
+    let mut paths: Vec<(String, PathBuf)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&reg_dir) {
+        for ent in rd.flatten() {
+            let dir = ent.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let p = dir.join("registry.toml");
+            if p.is_file() {
+                let name = dir
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                paths.push((name, p));
+            }
+        }
+    }
+    if paths.is_empty() {
+        // 目录在但没有账本：也归档，避免下次再扫
+        archive_registries(&reg_dir, &mut rep);
+        return Ok(rep);
+    }
+    paths.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let dst_path = registry_path(data_root);
+    let (mut dst, _) = ToolRegistry::load_or_init(&dst_path)?;
+    let before = toml::to_string_pretty(&dst).unwrap_or_default();
+    if dst_path.is_file() {
+        let bak = dst_path.with_extension("toml.bak");
+        let _ = std::fs::copy(&dst_path, &bak);
+    }
+
+    for (name, p) in &paths {
+        let text = match std::fs::read_to_string(p) {
+            Ok(t) => t,
+            Err(e) => {
+                rep.conflicts.push(format!("{name}: 读取失败（{e}）"));
+                continue;
+            }
+        };
+        let src: ToolRegistry = match toml::from_str(&text) {
+            Ok(r) => r,
+            Err(e) => {
+                rep.conflicts.push(format!("{name}: 解析失败（{e}）"));
+                continue;
+            }
+        };
+        rep.ledgers.push(name.clone());
+        for g in &src.groups {
+            match dst.groups.iter_mut().find(|d| d.id == g.id) {
+                Some(d) => {
+                    rep.groups_merged.push(g.id.clone());
+                    if d.enabled != g.enabled {
+                        rep.conflicts.push(format!(
+                            "组 {} 启用状态不一致（全局={} / {name}={}）",
+                            g.id, d.enabled, g.enabled
+                        ));
+                        d.enabled = d.enabled || g.enabled;
+                    }
+                    for e in &g.entries {
+                        match d.entries.iter_mut().find(|x| x.id == e.id) {
+                            Some(te) => {
+                                te.installed = te.installed || e.installed;
+                                te.enabled = te.enabled || e.enabled;
+                                if status_rank(&e.status) > status_rank(&te.status) {
+                                    te.status = e.status.clone();
+                                }
+                                if te.note.is_empty() {
+                                    te.note = e.note.clone();
+                                }
+                            }
+                            None => d.entries.push(e.clone()),
+                        }
+                    }
+                }
+                None => {
+                    rep.groups_added.push(g.id.clone());
+                    dst.groups.push(g.clone());
+                }
+            }
+        }
+    }
+
+    // 内置条目归位 + 保留组补齐，避免合并后同一工具出现两份
+    let mut changed = dst.rehome_builtins();
+    changed |= dst.ensure_builtins();
+    // 未分配组始终在末尾
+    if let Some(pos) = dst.groups.iter().position(|g| g.id == UNASSIGNED_GROUP) {
+        if pos != dst.groups.len() - 1 {
+            let g = dst.groups.remove(pos);
+            dst.groups.push(g);
+            changed = true;
+        }
+    }
+    let after = toml::to_string_pretty(&dst).unwrap_or_default();
+    if changed || after != before {
+        dst.save(&dst_path)?;
+    }
+
+    archive_registries(&reg_dir, &mut rep);
+    Ok(rep)
+}
+
+fn status_rank(s: &str) -> u8 {
+    match s {
+        status::OK => 3,
+        status::DISCOVERED => 2,
+        status::BROKEN => 1,
+        _ => 0,
+    }
+}
+
+/// 把旧 `registries/` 目录改名留档；失败只记冲突，不影响装配。
+fn archive_registries(reg_dir: &Path, rep: &mut ConsolidateReport) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dst = reg_dir.with_file_name(format!("registries.migrated-{ts}"));
+    match std::fs::rename(reg_dir, &dst) {
+        Ok(()) => rep.archived = Some(dst),
+        Err(e) => rep.conflicts.push(format!("旧账本目录归档失败（{e}），原目录保留")),
     }
 }
 
@@ -905,6 +1300,23 @@ mod tests {
         }
     }
 
+    /// 测试辅助：把快照里的候选全部安装。
+    ///
+    /// 新语义下扫描**不落库**（账本只记已安装），所以"装好之后的行为"类测试
+    /// 必须先对账再显式安装一遍。
+    fn install_all(reg: &mut ToolRegistry, snap: &ScanSnapshot) -> usize {
+        reg.reconcile(snap);
+        let mut n = 0;
+        for g in &snap.groups {
+            for e in &g.entries {
+                if reg.entry(&e.id).is_none() && reg.install_candidate(&g.id, &g.source, e).is_ok() {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     #[test]
     fn from_catalog_covers_all_builtins() {
         let reg = ToolRegistry::from_catalog();
@@ -941,7 +1353,7 @@ mod tests {
     }
 
     #[test]
-    fn discovered_group_is_not_installed_until_install() {
+    fn scan_does_not_write_candidates() {
         let mut reg = ToolRegistry::from_catalog();
         let snap = ScanSnapshot {
             groups: vec![ScannedGroup {
@@ -960,22 +1372,22 @@ mod tests {
                 }],
             }],
         };
-        let rep = reg.merge_scan(&snap);
-        assert_eq!(rep.new_entries, 1);
-        let (_, e) = reg.entry("file.copy").unwrap();
-        assert!(!e.installed, "扫描到不等于安装");
-        assert_eq!(e.status, status::DISCOVERED);
-        assert!(!reg.is_active("file.copy"));
+        let rep = reg.reconcile(&snap);
+        assert_eq!(rep.new_entries, 0, "候选不落库");
+        assert_eq!(rep.new_groups, 0, "扫描到组也不自动建组");
+        assert!(
+            reg.entry("file.copy").is_none(),
+            "扫描到不等于安装：账本里不能有它"
+        );
+        // 注意：不能用 is_active 判断——它对"查不到"默认放行（为运行时工具留口子），
+        // 插件装配用的是 is_installed && is_active 双闸门。
+        assert!(!reg.is_installed("file.copy"));
 
-        assert_eq!(reg.install_group("file"), 1);
-        {
-            let (g, e) = reg.entry("file.copy").unwrap();
-            eprintln!(
-                "DEBUG group_enabled={} installed={} enabled={} status=[{}]",
-                g.enabled, e.installed, e.enabled, e.status
-            );
-        }
-        assert!(reg.is_active("file.copy"), "安装并启用后才进工具面");
+        // 安装候选：由调用方把扫描结果传进来
+        let se = &snap.groups[0].entries[0];
+        reg.install_candidate("file", source::PLUGIN, se).unwrap();
+        assert!(reg.is_installed("file.copy"));
+        assert!(reg.is_active("file.copy"), "安装后才进工具面");
     }
 
     #[test]
@@ -998,13 +1410,12 @@ mod tests {
                 }],
             }],
         };
-        reg.merge_scan(&with_file);
-        reg.install_group("file");
+        assert_eq!(install_all(&mut reg, &with_file), 1);
         assert!(reg.is_active("file.copy"));
 
         // 文件被删：扫描不到该条目
         let empty = ScanSnapshot::default();
-        let rep = reg.merge_scan(&empty);
+        let rep = reg.reconcile(&empty);
         assert!(rep.broken >= 1);
         let (_, e) = reg.entry("file.copy").unwrap();
         assert_eq!(e.status, status::BROKEN, "条目必须保留并标 broken");
@@ -1013,14 +1424,20 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_keeps_entries_for_reinstall() {
+    fn uninstall_removes_entries_and_candidate_returns() {
         let mut reg = ToolRegistry::from_catalog();
+        assert_eq!(install_all(&mut reg, &plugin_snapshot("file", "file.demo", true)), 1);
+        assert!(reg.is_active("file.demo"));
+
         let n = reg.uninstall_group("file");
-        assert!(n >= 2);
-        assert!(!reg.is_active("file.read"));
-        assert!(reg.entry("file.read").is_some(), "条目本身不删");
-        reg.install_group("file");
-        assert!(reg.is_active("file.read"));
+        assert_eq!(n, 1);
+        assert!(
+            reg.entry("file.demo").is_none(),
+            "卸载即从账本删除（候选会从扫描结果回来）"
+        );
+        assert!(!reg.is_installed("file.demo"));
+        // 内置条目不受卸载影响（由代码提供，只能禁用）
+        assert!(reg.entry("file.read").is_some());
     }
 
     #[test]
@@ -1048,15 +1465,17 @@ mod tests {
     #[test]
     fn move_entry_changes_group_without_touching_flags() {
         let mut reg = ToolRegistry::from_catalog();
-        assert!(reg.set_entry_enabled("file.write", false));
-        let (from, to) = reg.move_entry("file.write", "shell").unwrap();
+        // 用插件条目测移动：内置工具不允许换组（见 builtin_tool_cannot_change_group）
+        assert_eq!(install_all(&mut reg, &plugin_snapshot("file", "file.demo", true)), 1);
+        assert!(reg.set_entry_enabled("file.demo", false));
+        let (from, to) = reg.move_entry("file.demo", "shell").unwrap();
         assert_eq!((from.as_str(), to.as_str()), ("file", "shell"));
-        let (g, e) = reg.entry("file.write").unwrap();
+        let (g, e) = reg.entry("file.demo").unwrap();
         assert_eq!(g.id, "shell");
         assert!(!e.enabled, "移动不该重置禁用状态");
-        assert!(reg.group("file").unwrap().entries.iter().all(|x| x.id != "file.write"));
+        assert!(reg.group("file").unwrap().entries.iter().all(|x| x.id != "file.demo"));
         // 目标组不存在时新建
-        let (_, to) = reg.move_entry("file.read", "tmp_group").unwrap();
+        let (_, to) = reg.move_entry("file.demo", "tmp_group").unwrap();
         assert_eq!(to, "tmp_group");
         assert!(reg.group("tmp_group").is_some());
     }
@@ -1082,14 +1501,13 @@ mod tests {
             }],
         };
         let mut reg = ToolRegistry::from_catalog();
-        reg.merge_scan(&snap);
-        reg.install_group("file");
+        assert_eq!(install_all(&mut reg, &snap), 1);
         assert_eq!(reg.entry("file.demo").unwrap().0.id, "file");
 
         reg.move_entry("file.demo", "shell").unwrap();
         assert_eq!(reg.entry("file.demo").unwrap().0.id, "shell");
 
-        let rep = reg.merge_scan(&snap);
+        let rep = reg.reconcile(&snap);
         let (g, e) = reg.entry("file.demo").unwrap();
         assert_eq!(g.id, "shell", "扫描不得把条目拉回原组");
         assert_eq!(e.status, status::OK, "文件还在，状态应保持 ok");
@@ -1118,18 +1536,22 @@ mod tests {
     }
 
     #[test]
-    fn new_scanned_entries_are_discovered_in_their_group() {
+    fn new_scanned_entries_stay_as_candidates() {
         let snap = plugin_snapshot("newplug", "newplug.hello", true);
         let mut reg = ToolRegistry::from_catalog();
-        let rep = reg.merge_scan(&snap);
-        assert_eq!(rep.new_groups, 1);
-        assert_eq!(rep.new_entries, 1);
+        let rep = reg.reconcile(&snap);
+        assert_eq!(rep.new_groups, 0, "扫描不自动建组");
+        assert_eq!(rep.new_entries, 0, "扫描不落库");
+        assert!(reg.entry("newplug.hello").is_none(), "候选不在注册表里");
+        assert!(reg.group("newplug").is_none(), "组要等安装时才创建");
 
+        // 显式安装：落成正式条目，组按需建出来
+        let se = &snap.groups[0].entries[0];
+        reg.install_candidate("newplug", source::PLUGIN, se).unwrap();
         let (g, e) = reg.entry("newplug.hello").unwrap();
-        assert_eq!(g.id, "newplug", "新组的新条目仍放原扫描组");
-        assert_eq!(e.status, status::DISCOVERED, "未安装的新条目应标记为 discovered");
-        assert!(!e.installed);
-        assert!(!e.enabled);
+        assert_eq!(g.id, "newplug");
+        assert_eq!(e.status, status::OK);
+        assert!(e.installed && e.enabled);
     }
 
     // ---------------------------------------------------------------- 契约 B
@@ -1150,12 +1572,13 @@ mod tests {
         reg.set_group_description("tools", "新描述").unwrap();
         assert_eq!(reg.group("tools").unwrap().description, "新描述");
 
-        // 删除组：组内条目全部落到未分配组
-        reg.move_entry("file.read", "tools").unwrap();
+        // 删除组：组内条目全部落到未分配组（用插件条目：内置工具不可换组）
+        assert_eq!(install_all(&mut reg, &plugin_snapshot("plug", "plug.c", true)), 1);
+        reg.move_entry("plug.c", "tools").unwrap();
         let n = reg.remove_group("tools").unwrap();
         assert_eq!(n, 1);
         assert!(reg.group("tools").is_none());
-        let (g, _) = reg.entry("file.read").unwrap();
+        let (g, _) = reg.entry("plug.c").unwrap();
         assert_eq!(g.id, UNASSIGNED_GROUP);
     }
 
@@ -1179,52 +1602,60 @@ mod tests {
     #[test]
     fn install_and_uninstall_single_entry() {
         let mut reg = ToolRegistry::from_catalog();
-        reg.merge_scan(&plugin_snapshot("plug", "plug.a", true));
-        assert_eq!(reg.entry("plug.a").unwrap().1.status, status::DISCOVERED);
+        let snap = plugin_snapshot("plug", "plug.a", true);
+        // 候选不在账本里 → 直接 install_entry 找不到它（必须先 install_candidate）
+        assert!(reg.install_entry("plug.a").is_err());
 
-        reg.install_entry("plug.a").unwrap();
+        let se = &snap.groups[0].entries[0];
+        reg.install_candidate("plug", source::PLUGIN, se).unwrap();
         {
             let (g, e) = reg.entry("plug.a").unwrap();
             assert_eq!(g.id, "plug");
-            assert!(e.installed);
+            assert!(e.installed && e.enabled);
             assert_eq!(e.status, status::OK);
-            assert!(e.enabled);
         }
-        reg.install_entry("plug.a").unwrap(); // 幂等
+        // 同一个工具只能在一个组：重复安装要明确拒绝
+        let err = reg.install_candidate("plug", source::PLUGIN, se).unwrap_err();
+        assert!(err.contains("已经装在"), "{err}");
 
         reg.uninstall_entry("plug.a").unwrap();
-        {
-            let (g, e) = reg.entry("plug.a").unwrap();
-            assert_eq!(g.id, "plug", "卸载后条目仍留在原组");
-            assert!(!e.installed);
-            assert_eq!(e.status, status::DISCOVERED);
-            assert!(!e.enabled);
-        }
-        reg.uninstall_entry("plug.a").unwrap(); // 幂等
+        assert!(reg.entry("plug.a").is_none(), "卸载 = 从账本删除");
+        assert!(!reg.is_installed("plug.a"));
 
         assert!(reg.install_entry("nope").is_err());
         assert!(reg.uninstall_entry("nope").is_err());
     }
 
     #[test]
-    fn install_entry_rejects_broken_and_unassigned() {
+    fn install_candidate_rejects_broken_and_marks_unassigned_disabled() {
         let mut reg = ToolRegistry::from_catalog();
-        reg.merge_scan(&plugin_snapshot("plug", "plug.broken", false));
-        assert_eq!(reg.entry("plug.broken").unwrap().1.status, status::BROKEN);
-        assert!(reg.install_entry("plug.broken").unwrap_err().contains("文件缺失，无法安装"));
+        let broken = plugin_snapshot("plug", "plug.broken", false);
+        let err = reg
+            .install_candidate("plug", source::PLUGIN, &broken.groups[0].entries[0])
+            .unwrap_err();
+        assert!(err.contains("文件缺失"), "{err}");
 
-        reg.merge_scan(&plugin_snapshot("plug2", "plug.ok", true));
-        reg.assign_entry("plug.ok", UNASSIGNED_GROUP).unwrap();
-        assert!(reg.install_entry("plug.ok").unwrap_err().contains("请先分配到组再安装"));
+        // 装进「未分配」：可以装（之后才能移动），但不可启用
+        let ok = plugin_snapshot("plug2", "plug.ok", true);
+        reg.install_candidate(UNASSIGNED_GROUP, source::PLUGIN, &ok.groups[0].entries[0])
+            .unwrap();
+        let (g, e) = reg.entry("plug.ok").unwrap();
+        assert_eq!(g.id, UNASSIGNED_GROUP);
+        assert!(e.installed, "未分配可以安装");
+        assert!(!e.enabled, "但不可启用");
     }
 
     #[test]
     fn unassigned_entry_cannot_be_enabled() {
         let mut reg = ToolRegistry::from_catalog();
-        reg.assign_entry("file.read", UNASSIGNED_GROUP).unwrap();
-        assert_eq!(reg.entry("file.read").unwrap().0.id, UNASSIGNED_GROUP);
-        assert!(!reg.set_entry_enabled("file.read", true), "未分配条目不可启用");
-        assert!(!reg.entry("file.read").unwrap().1.enabled);
+        // 内置工具进不了未分配（固定组），这里用插件条目验"未分配不可启用"
+        let snap = plugin_snapshot("plug", "plug.u", true);
+        reg.install_candidate("plug", source::PLUGIN, &snap.groups[0].entries[0])
+            .unwrap();
+        reg.assign_entry("plug.u", UNASSIGNED_GROUP).unwrap();
+        assert_eq!(reg.entry("plug.u").unwrap().0.id, UNASSIGNED_GROUP);
+        assert!(!reg.set_entry_enabled("plug.u", true), "未分配条目不可启用");
+        assert!(!reg.entry("plug.u").unwrap().1.enabled);
 
         // 普通组的启停不受影响
         assert!(reg.set_entry_enabled("file.write", false));
@@ -1238,29 +1669,238 @@ mod tests {
         let mut reg = ToolRegistry::from_catalog();
         reg.add_group("tools", "我的工具", "").unwrap();
 
-        // 已安装条目分配到普通组 → 自动启用
-        reg.assign_entry("file.read", "tools").unwrap();
-        let (g, e) = reg.entry("file.read").unwrap();
+        // 已安装条目分配到普通组 → 自动启用（用插件条目：内置工具不可换组）
+        let sx = plugin_snapshot("plug", "plug.x", true);
+        reg.install_candidate("plug", source::PLUGIN, &sx.groups[0].entries[0])
+            .unwrap();
+        reg.assign_entry("plug.x", "tools").unwrap();
+        let (g, e) = reg.entry("plug.x").unwrap();
         assert_eq!(g.id, "tools");
         assert!(e.installed && e.enabled);
 
+        // 内置工具换组 → 明确报"内置工具"，且原地不动
+        let err = reg.assign_entry("file.read", "tools").unwrap_err();
+        assert!(err.contains("内置工具"), "{err}");
+        assert_eq!(reg.entry("file.read").unwrap().0.id, "file");
+
         // 目标组不存在 → 中文错误，且不移动条目
-        assert!(reg.assign_entry("file.write", "nope").unwrap_err().contains("不存在"));
-        assert_eq!(reg.entry("file.write").unwrap().0.id, "file");
+        assert!(reg.assign_entry("plug.x", "nope").unwrap_err().contains("不存在"));
+        assert_eq!(reg.entry("plug.x").unwrap().0.id, "tools");
 
-        // 未安装条目分配到普通组 → 保持未启用
-        reg.merge_scan(&plugin_snapshot("plug", "plug.y", true));
-        reg.assign_entry("plug.y", "tools").unwrap();
-        let (_, e) = reg.entry("plug.y").unwrap();
-        assert!(!e.installed);
-        assert!(!e.enabled);
+        // 未安装的候选不能分配：账本里没有它，也就谈不上"归属"
+        let sy = plugin_snapshot("plug", "plug.y", true);
+        reg.reconcile(&sy);
+        assert!(reg.assign_entry("plug.y", "tools").unwrap_err().contains("不存在"));
 
-        // 安装后分配到未分配组 → 关闭启用
-        reg.install_entry("plug.y").unwrap();
-        assert!(reg.entry("plug.y").unwrap().1.enabled);
-        reg.assign_entry("plug.y", UNASSIGNED_GROUP).unwrap();
+        // 先装进未分配（已安装、未启用），再分配到普通组 → 启用
+        reg.install_candidate(UNASSIGNED_GROUP, source::PLUGIN, &sy.groups[0].entries[0])
+            .unwrap();
         let (g, e) = reg.entry("plug.y").unwrap();
         assert_eq!(g.id, UNASSIGNED_GROUP);
-        assert!(!e.enabled);
+        assert!(e.installed && !e.enabled, "未分配装得进去，但不能启用");
+
+        reg.assign_entry("plug.y", "tools").unwrap();
+        let (_, e) = reg.entry("plug.y").unwrap();
+        assert!(e.enabled, "分配到普通组后自动启用");
+    }
+
+    // ------------------------------------------------- 全局账本 / 内置固定组（r3）
+
+    #[test]
+    fn builtin_tool_cannot_change_group() {
+        let mut reg = ToolRegistry::from_catalog();
+        // assign_entry 是 UI 入口：给出明确原因
+        let err = reg.assign_entry("file.read", "net").unwrap_err();
+        assert!(err.contains("内置工具"), "{err}");
+        // move_entry 是底层入口：同样拒绝，不能只靠上层拦
+        assert!(reg.move_entry("file.read", UNASSIGNED_GROUP).is_none());
+        assert_eq!(reg.entry("file.read").unwrap().0.id, "file");
+        // 同组赋值是幂等操作，放行
+        assert!(reg.assign_entry("file.read", "file").is_ok());
+    }
+
+    #[test]
+    fn builtin_group_cannot_be_removed() {
+        let mut reg = ToolRegistry::from_catalog();
+        let err = reg.remove_group("file").unwrap_err();
+        assert!(err.contains("内置组"), "{err}");
+        assert!(reg.group("file").is_some(), "内置组不能被删掉");
+        // 用户建的组照常可删
+        reg.add_group("mygrp", "我的组", "").unwrap();
+        assert!(reg.remove_group("mygrp").is_ok());
+    }
+
+    /// 旧数据里被挪走的内置工具，load 时必须归位且只留一份。
+    #[test]
+    fn rehome_builtins_pulls_stray_copy_back() {
+        let mut reg = ToolRegistry::from_catalog();
+        let gi = reg.groups.iter().position(|g| g.id == "file").unwrap();
+        let ei = reg.groups[gi].entries.iter().position(|e| e.id == "file.read").unwrap();
+        let mut stray = reg.groups[gi].entries.remove(ei);
+        stray.enabled = false; // 用户曾禁用：归位后要保留这个设置
+        reg.groups
+            .iter_mut()
+            .find(|g| g.id == "net")
+            .unwrap()
+            .entries
+            .push(stray);
+
+        assert!(reg.rehome_builtins(), "有副本被挪走，应报告改动");
+        let owners: Vec<&str> = reg
+            .groups
+            .iter()
+            .filter(|g| g.entries.iter().any(|e| e.id == "file.read"))
+            .map(|g| g.id.as_str())
+            .collect();
+        assert_eq!(owners, vec!["file"], "内置条目必须唯一且在固定组");
+        assert!(!reg.entry("file.read").unwrap().1.enabled, "归位应保留禁用状态");
+        // 再跑一次应当无改动（幂等）
+        assert!(!reg.rehome_builtins());
+    }
+
+    /// 旧版按领域分账的账本要能合并进全局，并归档旧目录。
+    #[test]
+    fn consolidate_merges_old_domain_ledgers() {
+        let d = tmpdir("consolidate");
+        let _ = ToolRegistry::load_or_init(&registry_path(&d)).unwrap();
+
+        // 旧领域账本：多一个自定义组 recon，且把 file 组关掉（与全局冲突）
+        let mut old = ToolRegistry::from_catalog();
+        old.groups.iter_mut().find(|g| g.id == "file").unwrap().enabled = false;
+        old.groups.push(GroupRecord {
+            id: "recon".into(),
+            name: "侦察".into(),
+            description: String::new(),
+            kind: "tools".into(),
+            source: source::PLUGIN.into(),
+            enabled: true,
+            entries: vec![EntryRecord {
+                id: "recon.whois".into(),
+                name: "WHOIS".into(),
+                source: source::PLUGIN.into(),
+                path: "recon/whois".into(),
+                risk: "low".into(),
+                capabilities: vec![],
+                installed: true,
+                enabled: true,
+                status: status::OK.into(),
+                note: String::new(),
+            }],
+        });
+        let dir = d.join("registries").join("pentest");
+        std::fs::create_dir_all(&dir).unwrap();
+        old.save(&dir.join("registry.toml")).unwrap();
+
+        let rep = consolidate(&d).unwrap();
+        assert_eq!(rep.ledgers, vec!["pentest"]);
+        assert!(rep.groups_added.contains(&"recon".to_string()), "{:?}", rep.groups_added);
+
+        let (merged, _) = ToolRegistry::load_or_init(&registry_path(&d)).unwrap();
+        assert!(merged.group("recon").is_some(), "旧账本独有的组应带进全局");
+        assert!(merged.is_active("recon.whois"));
+        assert!(
+            merged.group("file").unwrap().enabled,
+            "冲突按「任一启用即启用」：不能被旧账本关掉"
+        );
+        assert!(!d.join("registries").exists(), "旧目录应被归档改名");
+        assert!(rep.archived.as_ref().map(|p| p.exists()).unwrap_or(false));
+
+        // 幂等：再跑一次什么都不做
+        assert!(consolidate(&d).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 未分配组的 id 必须就是磁盘目录名，且不能被扫描跳过。
+    ///
+    /// 这条断言是跨 crate 的契约：`plugin-host` 不认识注册表，但它负责按目录名
+    /// 建组。历史上 id 是 `__unassigned__`（带下划线），而扫描会跳过 `_` 开头的
+    /// 目录 —— 结果是"未分配目录永远扫不到，往里放的 dll 凭空消失"。
+    #[test]
+    fn unassigned_id_matches_plugin_dir() {
+        assert_eq!(UNASSIGNED_GROUP, plugin_host::adopt::UNASSIGNED_DIR);
+        assert!(
+            !UNASSIGNED_GROUP.starts_with('_') && !UNASSIGNED_GROUP.starts_with('.'),
+            "扫描会跳过 _ / . 开头的目录，id 不能是那个形状"
+        );
+        assert!(!catalog::is_base_group(UNASSIGNED_GROUP), "未分配不是内置基础组");
+    }
+
+    #[test]
+    fn slug_group_id_makes_dir_safe_names() {
+        assert_eq!(slug_group_id("my tools"), "my_tools");
+        assert_eq!(slug_group_id("  My-Tools!!  "), "my_tools");
+        assert_eq!(slug_group_id("a  b"), "a_b", "连续分隔符收成一个");
+        // 纯中文派生不出 ASCII：退化成 grp（再靠 unique 加序号）
+        assert_eq!(slug_group_id("我的抓包工具"), "grp");
+        // 数字开头加前缀，避免和"编号目录"混淆
+        assert_eq!(slug_group_id("2fa"), "grp_2fa");
+        // 超长名截断到 24，且不留尾部分隔符
+        let long = slug_group_id(&"x".repeat(60));
+        assert_eq!(long.len(), 24);
+        assert!(!long.ends_with('_'));
+        // 不能以 _ 或 . 开头（扫描会跳过）
+        for n in ["_hidden", ".dot", "  ", "", "!!"] {
+            let s = slug_group_id(n);
+            assert!(!s.starts_with('_') && !s.starts_with('.'), "{n:?} -> {s}");
+            assert!(!s.is_empty());
+        }
+    }
+
+    #[test]
+    fn unique_group_id_avoids_taken_and_reserved() {
+        let mut taken = vec!["grp".to_string(), "file".to_string()];
+        let a = unique_group_id("grp", |c| taken.iter().any(|x| x == c));
+        assert_eq!(a, "grp_2");
+        taken.push(a);
+        let b = unique_group_id("grp", |c| taken.iter().any(|x| x == c));
+        assert_eq!(b, "grp_3");
+        // 与内置基础组同名也算占用
+        assert_ne!(unique_group_id("core", |_| false), "core");
+        // 未分配是保留 id
+        assert_ne!(
+            unique_group_id(UNASSIGNED_GROUP, |_| false),
+            UNASSIGNED_GROUP
+        );
+    }
+
+    #[test]
+    fn migrate_renames_legacy_unassigned_id() {
+        let d = std::env::temp_dir().join(format!("wpb_reg_mig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let path = registry_path(&d);
+
+        // 造一份"旧版账本"：未分配组还叫 __unassigned__，里面躺着一个条目
+        let mut old = ToolRegistry::from_catalog();
+        for g in &mut old.groups {
+            if g.id == UNASSIGNED_GROUP {
+                g.id = "__unassigned__".to_string();
+            }
+        }
+        old.group_mut("__unassigned__").unwrap().entries.push(EntryRecord {
+            id: "plug.a".into(),
+            name: "plug.a".into(),
+            source: source::PLUGIN.into(),
+            path: "plug.a.dll".into(),
+            risk: "low".into(),
+            capabilities: vec![],
+            installed: true,
+            enabled: false,
+            status: status::OK.into(),
+            note: String::new(),
+        });
+        old.save(&path).unwrap();
+
+        let (reg, _) = ToolRegistry::load_or_init(&path).unwrap();
+        assert!(reg.group("__unassigned__").is_none(), "旧 id 应已改名");
+        let g = reg.group(UNASSIGNED_GROUP).expect("未分配组应存在");
+        assert_eq!(g.entries.len(), 1, "条目要跟着一起搬，不能变孤儿");
+        assert_eq!(g.entries[0].id, "plug.a");
+        assert_eq!(
+            reg.groups.iter().filter(|g| g.id == UNASSIGNED_GROUP).count(),
+            1,
+            "不能因为改名多出一个未分配组"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

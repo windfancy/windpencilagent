@@ -23,7 +23,7 @@ use wpa_engine::{assemble, build_session, Base, SessionInfo, SessionOpts};
 
 use crate::{
     AppWindow, CapGroupRow, CfgCard, CfgItem, ChatMsg, DayRow, DomainCardRow, DomainGroupChip,
-    RegEntryRow, RegGroupRow, KnowledgeRow, SessionRow,
+    KbStoreRow, RegEntryRow, RegGroupRow, KnowledgeRow, SessionRow, DomainExtRow,
     ModelRow, SpaceRow, TaskRow, ToolRow, TraceRow,
 };
 
@@ -72,6 +72,10 @@ pub enum Cmd {
     DomainToggleGroup(String),
     /// 领域页保存组引用（写 domain.toml + 重新装配）
     DomainSaveGroups,
+    /// 领域页：加一个私有外部工具（写 domain.toml 的 `[[external]]`）
+    DomainExtAdd { kind: String, path: String, usage: String },
+    /// 领域页：移除第 n 条外部工具
+    DomainExtRemove(usize),
     /// 读档案并回填编辑表单
     EditModel(String),
     /// 新建（清空表单）
@@ -112,6 +116,9 @@ pub enum Cmd {
     },
     /// #9.1 会话管理（参数=空间过滤，空串=全部）
     SessionList(String),
+    /// 只读预览：拉一条会话的消息到会话页右侧面板，**不动当前对话**
+    SessionView(String),
+    /// 真正切换当前会话（会话页「继续此会话」/ 召回后才用）
     SessionOpen(String),
     SessionDelete(String),
     SessionExport(String),
@@ -121,6 +128,11 @@ pub enum Cmd {
     DomainRemove(String),
     DomainFileRead { id: String, file: String },
     DomainFileSave { id: String, file: String, text: String },
+    /// 领域概要保存（≤300 字）
+    DomainSummarySave { id: String, summary: String },
+    /// 按概要调用大模型生成四份配置并替换（原文件先 .bak 备份）。
+    /// 带 summary = 用编辑框里**当前**的文本（不必先保存也能生成）。
+    DomainAiGenerate { id: String, summary: String },
     /// #7.2 知识管理
     KnowledgeAdd { name: String, text: String },
     KnowledgeRemove(String),
@@ -293,6 +305,10 @@ fn build_cfg_cards(cfg: &AppConfig) -> Vec<CfgCard> {
             let items: Vec<CfgItem> = c
                 .fields
                 .iter()
+                // 领域页不再渲染「激活领域」按钮：状态栏的领域 chip 与详情页
+                // 「切换到此领域」已经覆盖同一操作，重复一排按钮只会挤占界面。
+                // 字段本身仍留在 schema 里（CLI / config set 照旧可用）。
+                .filter(|f| !(c.page.id() == "domain" && f.key == "domain.active"))
                 .map(|f| {
                     // 候选项：Enum 在编译期就确定；Pick/Action 要读运行期状态
                     // （领域目录、已有档案、内置预设），所以在建卡片时解析一次。
@@ -373,18 +389,13 @@ fn publish_cfg_cards(app: &AppWindow, cfg: &AppConfig) {
 }
 
 impl Engine {
-    /// 下发空间页的工具组勾选 chips（全部基座组 + 当前空间已选）。
+    /// 下发空间页的工具组勾选 chips（可配置组 + 当前空间已选）。
+    ///
+    /// 基础组（core/shell/sandbox/space/memory/kb）不在这里出现：它们永远可用，
+    /// 列出来只会让用户以为"没勾就没有"，从而把系统勾坏。
     fn push_space_group_chips(&self) {
         let snap = self.base.snapshot();
-        let chips: Vec<DomainGroupChip> = snap
-            .cap_groups
-            .iter()
-            .map(|g| DomainGroupChip {
-                id: g.id.clone().into(),
-                label: g.label.clone().into(),
-                declared: self.space_group_edit.iter().any(|x| x == &g.id),
-            })
-            .collect();
+        let chips = build_group_chips(&snap, &self.space_group_edit);
         let whitelist = self.space_group_edit.join("\n");
         ui_set(&self.window, move |app| {
             app.set_space_group_chips(ModelRc::new(VecModel::from(chips)));
@@ -400,9 +411,14 @@ impl Engine {
     /// 且会话/模型切换读的还是旧快照（看起来"要重启才生效"）。写盘成功后统一回灌即可。
     fn sync_base_cfg(&mut self) {
         self.base.cfg = self.cfg.clone();
+        // 向量库的 embedding 档案也跟着换：否则切换模型后 kb.vec.* 还在调旧档案
+        self.base.embedder.update_from(&self.cfg);
     }
 
-    /// 下发领域页的组 chips：全部基座组 + 内存编辑态的勾选标记。
+    /// 下发领域页的组 chips：**只列可配置组** + 内存编辑态的勾选标记。
+    ///
+    /// 基础组是系统内部前提（永远可用），既不显示也不写进 domain.toml，
+    /// 否则用户会以为"不勾就没有"而把它们删掉，装出来的工具面直接缺胳膊少腿。
     ///
     /// 编辑态为空（还没选中领域 / 刚保存）时按"选中领域的声明"显示，不标 dirty。
     fn push_domain_chips(&self, snap: &wpa_engine::Snapshot, dirty: bool) {
@@ -411,15 +427,7 @@ impl Engine {
             .as_ref()
             .map(|(_, g)| g.clone())
             .unwrap_or_default();
-        let chips: Vec<DomainGroupChip> = snap
-            .cap_groups
-            .iter()
-            .map(|g| DomainGroupChip {
-                id: g.id.clone().into(),
-                label: g.label.clone().into(),
-                declared: declared.iter().any(|x| x == &g.id),
-            })
-            .collect();
+        let chips = build_group_chips(snap, &declared);
         ui_set(&self.window, move |app| {
             app.set_domain_chips(ModelRc::new(VecModel::from(chips)));
             app.set_domain_dirty(dirty);
@@ -428,30 +436,61 @@ impl Engine {
 }
 
 
-/// 取 base 当前快照里的领域列表（首个快照调用点使用）。
-fn snap_domains_of(base: &Base) -> Option<wpa_engine::DomainCardRow> {
-    base.snapshot().domains.into_iter().find(|d| d.active)
+/// 组 chips 的统一数据源：**全局注册表里的组**（含插件组），排除基础组与「未分配」。
+///
+/// 为什么不用 `cap_groups`：那是 `catalog::CAP_GROUPS` 静态表，只有内置组，
+/// 插件组永远列不出来 —— 领域自然也就无法引用插件组，插件工具必然被收敛掉。
+///
+/// 候选组（扫到但一个都没装）不列：引用一个空组没有意义，只会让 chips 越滚越长；
+/// 组装上东西或启用后会自动出现。
+fn build_group_chips(
+    snap: &wpa_engine::Snapshot,
+    selected: &[String],
+) -> Vec<DomainGroupChip> {
+    snap.reg_groups
+        .iter()
+        .filter(|g| !wpa_engine::catalog::is_base_group(&g.id))
+        .filter(|g| g.id != wpa_engine::registry::UNASSIGNED_GROUP)
+        .filter(|g| g.enabled || g.total > 0)
+        .map(|g| DomainGroupChip {
+            id: g.id.clone().into(),
+            label: g.label.clone().into(),
+            declared: selected.iter().any(|x| x == &g.id),
+            enabled: g.enabled,
+        })
+        .collect()
+}
+
+/// 把绝对路径写成相对领域目录的形式（在领域目录内时）。
+///
+/// 为什么坚持相对路径：领域目录整体搬走/改名后，绝对路径就全废了；而
+/// `domain.toml` 是要跟着领域包走的文件。领域目录之外的路径只能存绝对路径。
+fn relativize(domain_dir: &std::path::Path, path: &str) -> String {
+    let p = std::path::Path::new(path.trim());
+    if !p.is_absolute() {
+        return path.trim().to_string();
+    }
+    // 大小写不敏感比较：Windows 上用户从对话框拿到的盘符大小写可能与配置不同
+    let norm = |s: &str| s.replace('\\', "/").to_lowercase();
+    let base = norm(&domain_dir.to_string_lossy());
+    let full = norm(&p.to_string_lossy());
+    if let Some(rest) = full.strip_prefix(&format!("{base}/")) {
+        // 用原路径的切片恢复真实大小写，避免把用户路径写成全小写
+        let raw = p.to_string_lossy().replace('\\', "/");
+        return raw[raw.len() - rest.len()..].to_string();
+    }
+    path.trim().to_string()
 }
 
 fn apply_snapshot(base: &Base, window: &slint::Weak<AppWindow>) {
+    let snap = base.snapshot();
     // 领域页组 chips 首次初始化：按激活领域的声明显示（未进入编辑态）
-    if let Some(d) = snap_domains_of(base) {
-        let chips: Vec<DomainGroupChip> = base
-            .snapshot()
-            .cap_groups
-            .iter()
-            .map(|g| DomainGroupChip {
-                id: g.id.clone().into(),
-                label: g.label.clone().into(),
-                declared: d.groups.iter().any(|x| x == &g.id),
-            })
-            .collect();
+    if let Some(d) = snap.domains.iter().find(|d| d.active) {
+        let chips = build_group_chips(&snap, &d.groups);
         ui_set(window, move |app| {
             app.set_domain_chips(ModelRc::new(VecModel::from(chips)));
         });
     }
-
-    let snap = base.snapshot();
 
     let tools: Vec<ToolRow> = snap
         .tools
@@ -482,9 +521,16 @@ fn apply_snapshot(base: &Base, window: &slint::Weak<AppWindow>) {
     let isolated: Vec<slint::SharedString> =
         snap.isolated.iter().map(|s| s.clone().into()).collect();
     // 知识/技能：技能按名字+触发场景列出；知识条目由当前领域 provider 提供（#7.2）
+    // 必须显式传 knowledge.md：provider 的 entries 参数是"要加载哪些文件"，
+    // 传空数组 = 一个文件都不读，列表永远是 0 条（这正是之前的 bug）。
     let knowledge_entries: Vec<String> = {
         let dir = base.cfg.active_domain_dir();
-        let provider = knowledge_core::FileKnowledgeProvider::from_dir("domain", &dir, &[], None);
+        let provider = knowledge_core::FileKnowledgeProvider::from_dir(
+            "domain",
+            &dir,
+            &["knowledge.md".to_string()],
+            None,
+        );
         provider.list_entries()
     };
     let knowledge: Vec<slint::SharedString> = knowledge_entries.iter().map(|s| s.clone().into()).collect();
@@ -585,6 +631,41 @@ fn apply_snapshot(base: &Base, window: &slint::Weak<AppWindow>) {
                 )),
                 tools: d.tools as i32,
                 knowledge_entries: d.knowledge_entries as i32,
+                // 知识库行含 ModelRc（数组字段），必须在 UI 线程里构造
+                kb: ModelRc::new(VecModel::from(
+                    d.kb
+                        .iter()
+                        .map(|k| KbStoreRow {
+                            kind: k.kind.clone().into(),
+                            label: k.label.clone().into(),
+                            location: k.location.clone().into(),
+                            purpose: k.purpose.clone().into(),
+                            entries: k.entries as i32,
+                            error: k.error.clone().into(),
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+                // 领域私有外部工具（index 用于"移除第 n 条"）
+                external: ModelRc::new(VecModel::from(
+                    d.external
+                        .iter()
+                        .map(|e| DomainExtRow {
+                            index: e.index as i32,
+                            kind: e.kind.clone().into(),
+                            name: e.name.clone().into(),
+                            path: e.path.clone().into(),
+                            usage: e.usage.clone().into(),
+                            exists: e.exists,
+                            tools: ModelRc::new(VecModel::from(
+                                e.tools
+                                    .iter()
+                                    .map(|t| slint::SharedString::from(t.clone()))
+                                    .collect::<Vec<_>>(),
+                            )),
+                            error: e.error.clone().into(),
+                        })
+                        .collect::<Vec<_>>(),
+                )),
                 has_workflow: d.has_workflow,
                 active: d.active,
                 error: d.error.clone().into(),
@@ -637,6 +718,7 @@ fn apply_snapshot(base: &Base, window: &slint::Weak<AppWindow>) {
                 status: e.status.clone().into(),
                 enabled: e.enabled,
                 installed: e.installed,
+                installable: e.installable,
                 group_enabled: e.group_enabled,
                 note: e.note.clone().into(),
             })
@@ -864,13 +946,28 @@ impl Engine {
     fn push_ab_detail(&self, id: &str) {
         let snap = self.base.snapshot();
         let hit = snap.reg_entries.iter().find(|e| e.id == id).cloned();
-        let (name, group, source, risk, status, note, installed, enabled) = match hit {
+        let (name, group, source, risk, status, note, installed, installable, enabled) = match hit {
             Some(e) => (
-                e.name, e.group, e.source, e.risk, e.status, e.note, e.installed, e.enabled,
+                e.name,
+                e.group,
+                e.source,
+                e.risk,
+                e.status,
+                e.note,
+                e.installed,
+                e.installable,
+                e.enabled,
             ),
             None => (
-                String::new(), String::new(), String::new(), String::new(),
-                String::new(), String::new(), false, false,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                false,
+                false,
+                false,
             ),
         };
         let id = id.to_string();
@@ -883,6 +980,7 @@ impl Engine {
             app.set_ab_status(status.into());
             app.set_ab_note(note.into());
             app.set_ab_installed(installed);
+            app.set_ab_installable(installable);
             app.set_ab_enabled(enabled);
         });
     }
@@ -1616,44 +1714,114 @@ impl Engine {
                     None
                 };
                 if group_op.is_some() {
-                    let path = wpa_engine::registry::domain_registry_path(&self.cfg.data_root(), &self.cfg.domain.active);
+                    let path = wpa_engine::registry::registry_path(&self.cfg.data_root());
+                    // 删组前先查引用：必须在拿 registry 写锁**之前**算，
+                    // snapshot() 内部会再读这把锁，持锁调用会自锁。
+                    let group_refs: Vec<String> = if op == "group-remove" {
+                        self.base
+                            .snapshot()
+                            .domains
+                            .iter()
+                            .filter(|d| d.groups.iter().any(|g| g == &id))
+                            .map(|d| d.id.clone())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     let mut reg = self.base.registry.write().unwrap_or_else(|e| e.into_inner());
                     let (scanned, _) = wpa_engine::registry::scan_plugins(&self.base.cfg.plugins_root());
-                    reg.merge_scan(&scanned);
+                    reg.reconcile(&scanned);
+                    // 新建组时自动派生 id：用户只该输入组名，手敲 id 属于"手书"，
+                    // 而且还要保证它是个合法目录名——那是程序该干的事。
+                    let mut created: Option<(String, String)> = None;
+                    // assign 成功后要搬目录（账改了、文件也得跟着走）
+                    let mut assigned_to: Option<String> = None;
                     let result: Result<(), String> = if let Some(name) = op.strip_prefix("group-add:") {
-                        reg.add_group(name.trim(), name.trim(), "")
+                        let display = name.trim().to_string();
+                        if display.is_empty() {
+                            Err("组名称不能为空".to_string())
+                        } else {
+                            let base = wpa_engine::registry::slug_group_id(&display);
+                            let gid = wpa_engine::registry::unique_group_id(&base, |c| {
+                                reg.groups.iter().any(|g| g.id == c)
+                            });
+                            match reg.add_group(&gid, &display, "") {
+                                Ok(()) => {
+                                    created = Some((gid, display));
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
                     } else if let Some(name) = op.strip_prefix("group-rename:") {
                         reg.rename_group(&id, name.trim())
                     } else if op == "group-remove" {
-                        reg.remove_group(&id).map(|_| ())
+                        if !group_refs.is_empty() {
+                            Err(format!(
+                                "组 {id} 被领域 {} 引用；先去那些领域页取消引用，再删组",
+                                group_refs.join("、")
+                            ))
+                        } else {
+                            reg.remove_group(&id).map(|_| ())
+                        }
                     } else if let Some(desc) = op.strip_prefix("group-desc:") {
                         reg.set_group_description(&id, desc)
                     } else if let Some(group) = op.strip_prefix("assign:") {
-                        reg.assign_entry(&id, group)
+                        match reg.assign_entry(&id, group) {
+                            Ok(()) => {
+                                assigned_to = Some(group.to_string());
+                                Ok(())
+                            }
+                            Err(e) => Err(e),
+                        }
                     } else {
                         unreachable!()
                     };
-                    let msg = match result {
+                    let (ok, mut msg) = match result {
                         Ok(()) => match reg.save(&path) {
-                            Ok(()) => format!("{}：成功（已保存）", group_op.unwrap()),
-                            Err(e) => format!("保存失败：{e}"),
+                            Ok(()) => (true, format!("{}：成功（已保存）", group_op.unwrap())),
+                            Err(e) => (false, format!("保存失败：{e}")),
                         },
-                        Err(e) => e,
+                        Err(e) => (false, e),
                     };
                     drop(reg);
+                    // 建组顺带建目录 + 清单：不建的话用户没法往里放 dll，
+                    // 放了也扫不到（扫描只认带 PnC.toml 的目录）。
+                    if ok {
+                        if let Some((gid, gname)) = &created {
+                            let root = self.base.cfg.plugins_root();
+                            match wpa_engine::registry::ensure_group_dir(&root, gid, gname, "") {
+                                Ok(dir) => {
+                                    msg = format!("{msg}；已建目录 {}", dir.display());
+                                }
+                                Err(e) => {
+                                    msg = format!("{msg}；但建目录失败：{e}（往组里放 dll 前请手工建目录）")
+                                }
+                            }
+                        }
+                        // 分配成功后搬文件：账上说在 B，磁盘也得在 B，
+                        // 否则"账上在 B、实际从 A 加载"。
+                        if let Some(g) = &assigned_to {
+                            let root = self.base.cfg.plugins_root();
+                            let note = wpa_engine::registry::relocate_plugin(&root, &id, g);
+                            if !note.is_empty() {
+                                msg = format!("{msg}；{note}");
+                            }
+                        }
+                    }
                     self.reload_tree();
                     toast(&self.window, msg);
                     return;
                 }
                 // move:<组id> = 组↔条目绑定（换归属不动开关）
                 if let Some(to_group) = op.strip_prefix("move:") {
-                    let path = wpa_engine::registry::domain_registry_path(&self.cfg.data_root(), &self.cfg.domain.active);
+                    let path = wpa_engine::registry::registry_path(&self.cfg.data_root());
                     let mut reg = match self.base.registry.write() {
                         Ok(g) => g,
                         Err(e) => e.into_inner(),
                     };
                     let (snap, _) = wpa_engine::registry::scan_plugins(&self.base.cfg.plugins_root());
-                    reg.merge_scan(&snap);
+                    reg.reconcile(&snap);
                     let msg = match reg.move_entry(&id, to_group) {
                         Some((from, to)) if from == to => {
                             format!("{id} 已经在组 {to} 里")
@@ -1661,17 +1829,28 @@ impl Engine {
                         Some((from, to)) => match reg.save(&path) {
                             Ok(()) => {
                                 drop(reg);
+                                // 账改完再搬目录：搬不动（被占用）会登记待下次启动重试，
+                                // 账不回滚——用户的意图是对的，只是时机不对。
+                                let root = self.base.cfg.plugins_root();
+                                let note = wpa_engine::registry::relocate_plugin(&root, &id, &to);
                                 self.reload_tree();
-                                format!("{id}：{from} → {to}（已重新装配）")
+                                if note.is_empty() {
+                                    format!("{id}：{from} → {to}（已重新装配）")
+                                } else {
+                                    format!("{id}：{from} → {to}；{note}")
+                                }
                             }
                             Err(e) => format!("移动后保存失败：{e}"),
                         },
-                        None => format!("注册表里没有条目 `{id}`"),
+                        None => format!(
+                            "注册表里没有可移动的条目 `{id}`（内置工具固定属于原组，不能换组）"
+                        ),
                     };
                     toast(&self.window, msg);
                     return;
                 }
-                let path = wpa_engine::registry::domain_registry_path(&self.cfg.data_root(), &self.cfg.domain.active);
+                let path = wpa_engine::registry::registry_path(&self.cfg.data_root());
+                let (scanned, _) = wpa_engine::registry::scan_plugins(&self.base.cfg.plugins_root());
                 let msg = {
                     let mut reg = match self.base.registry.write() {
                         Ok(g) => g,
@@ -1680,15 +1859,39 @@ impl Engine {
                     let is_group = reg.group(&id).is_some();
                     let out = match (op.as_str(), is_group) {
                         ("install", true) => {
-                            let n = reg.install_group(&id);
-                            format!("组 {id} 已安装：{n} 个条目")
+                            // 组里的候选来自扫描快照（注册表只有已安装的）
+                            let n = reg.install_group_from(&id, &scanned);
+                            if n == 0 && reg.group(&id).map(|g| g.entries.is_empty()).unwrap_or(true) {
+                                format!("组 {id} 里没有可安装的条目（检查 dll 是否齐全）")
+                            } else {
+                                format!("组 {id} 已安装：{n} 个条目")
+                            }
                         }
                         // #4 单条安装/卸载：走完整状态机（installed + status），
                         // 不再只改 enabled——那正是"点安装没变化/卸载显示禁用"的根因。
-                        ("install", false) => match reg.install_entry(&id) {
-                            Ok(()) => format!("条目 {id} 已安装"),
-                            Err(e) => e,
-                        },
+                        ("install", false) => {
+                            if reg.is_installed(&id) {
+                                format!("条目 {id} 已安装")
+                            } else {
+                                // 候选不在注册表里（账本只记已安装）：从扫描快照找回它再落库
+                                let hit = scanned
+                                    .groups
+                                    .iter()
+                                    .flat_map(|g| g.entries.iter().map(move |e| (g, e)))
+                                    .find(|(_, e)| e.id == id);
+                                match hit {
+                                    Some((g, e)) => {
+                                        match reg.install_candidate(&g.id, &g.source, e) {
+                                            Ok(()) => format!("条目 {id} 已安装（组 {}）", g.id),
+                                            Err(err) => err,
+                                        }
+                                    }
+                                    None => format!(
+                                        "找不到条目 {id}：既不在注册表里，也不在扫描结果里"
+                                    ),
+                                }
+                            }
+                        }
                         ("uninstall", true) => {
                             let n = reg.uninstall_group(&id);
                             format!("组 {id} 已卸载：{n} 个条目转为候选")
@@ -1712,17 +1915,61 @@ impl Engine {
                             }
                         }
                         ("group-on", _) => {
-                            if reg.set_group_enabled(&id, true) {
-                                format!("组 {id} 已启用")
-                            } else {
-                                format!("组 {id} 已是启用状态")
+                            // 组开关的唯一账本是注册表。插件组要先过依赖校验
+                            // （requires_groups 的闭包与环检测），内置组没有依赖声明。
+                            let enabled: std::collections::BTreeSet<String> = reg
+                                .groups
+                                .iter()
+                                .filter(|g| g.enabled)
+                                .map(|g| g.id.clone())
+                                .collect();
+                            let chk = match self.base.plugins.as_ref() {
+                                Some(h) if h.report().group(&id).is_some() => {
+                                    h.check_enable(&enabled, &id)
+                                }
+                                _ => Ok(vec![id.clone()]),
+                            };
+                            match chk {
+                                Ok(more) => {
+                                    let mut n = 0;
+                                    for g in &more {
+                                        if reg.set_group_enabled(g, true) {
+                                            n += 1;
+                                        }
+                                    }
+                                    if n == 0 {
+                                        format!("组 {id} 已是启用状态")
+                                    } else if more.len() > 1 {
+                                        format!("组 {id} 已启用（连带依赖组：{}）", more.join(" → "))
+                                    } else {
+                                        format!("组 {id} 已启用")
+                                    }
+                                }
+                                Err(e) => e,
                             }
                         }
                         ("group-off", _) => {
-                            if reg.set_group_enabled(&id, false) {
-                                format!("组 {id} 已停用")
-                            } else {
-                                format!("组 {id} 已是停用状态")
+                            let enabled: std::collections::BTreeSet<String> = reg
+                                .groups
+                                .iter()
+                                .filter(|g| g.enabled)
+                                .map(|g| g.id.clone())
+                                .collect();
+                            let chk = match self.base.plugins.as_ref() {
+                                Some(h) if h.report().group(&id).is_some() => {
+                                    h.check_disable(&enabled, &id)
+                                }
+                                _ => Ok(()),
+                            };
+                            match chk {
+                                Err(e) => e,
+                                Ok(()) => {
+                                    if reg.set_group_enabled(&id, false) {
+                                        format!("组 {id} 已停用")
+                                    } else {
+                                        format!("组 {id} 已是停用状态")
+                                    }
+                                }
                             }
                         }
                         (other, _) => format!("未知操作：{other}"),
@@ -1752,6 +1999,20 @@ impl Engine {
                     toast(&self.window, "先在左侧选中一个领域");
                     return;
                 };
+                // 全局禁用的组不能新增引用：引用了也不会生效，只会让人以为"配了没反应"
+                let enabled = snap
+                    .reg_groups
+                    .iter()
+                    .find(|g| g.id == *gid)
+                    .map(|g| g.enabled)
+                    .unwrap_or(true);
+                if !enabled && !groups.contains(&gid) {
+                    toast(
+                        &self.window,
+                        format!("组 {gid} 已在「能力」页全局禁用；先启用它，才能被领域引用"),
+                    );
+                    return;
+                }
                 match groups.iter().position(|x| *x == *gid) {
                     Some(i) => {
                         groups.remove(i);
@@ -1759,6 +2020,73 @@ impl Engine {
                     None => groups.push(gid.clone()),
                 }
                 self.push_domain_chips(&snap, true);
+            }
+            Cmd::DomainExtAdd { kind, path, usage } => {
+                let Some((id, _)) = self.domain_edit.clone() else {
+                    toast(&self.window, "先在左侧选中一个领域");
+                    return;
+                };
+                let file = self.base.cfg.domains_root().join(&id).join("domain.toml");
+                let mut decls = match wpa_engine::domain::load(&self.base.cfg.domains_root().join(&id)) {
+                    Ok(p) => p.external,
+                    Err(e) => {
+                        toast(&self.window, format!("领域 {id} 装载失败：{e}"));
+                        return;
+                    }
+                };
+                // 路径统一转成相对领域目录的写法：领域目录整体搬走后仍然可用
+                let path = relativize(&self.base.cfg.domains_root().join(&id), &path);
+                if decls.iter().any(|d| d.path == path && d.kind_norm() == kind) {
+                    toast(&self.window, format!("这条外部工具已经登记过了：{path}"));
+                    return;
+                }
+                decls.push(wpa_engine::domain::ExternalDecl {
+                    kind: kind.clone(),
+                    path: path.clone(),
+                    name: String::new(),
+                    usage,
+                    namespace: String::new(),
+                    risk: String::new(),
+                    args: Vec::new(),
+                    params: Default::default(),
+                    stdin: String::new(),
+                });
+                match wpa_engine::domain::set_external(&file, &decls) {
+                    Ok(()) => {
+                        self.reload_tree();
+                        toast(&self.window, format!("已加外部工具：{path}（{} 条）", decls.len()));
+                    }
+                    Err(e) => toast(&self.window, format!("写入失败：{e}")),
+                }
+            }
+            Cmd::DomainExtRemove(idx) => {
+                let Some((id, _)) = self.domain_edit.clone() else {
+                    toast(&self.window, "先在左侧选中一个领域");
+                    return;
+                };
+                let file = self.base.cfg.domains_root().join(&id).join("domain.toml");
+                let mut decls = match wpa_engine::domain::load(&self.base.cfg.domains_root().join(&id)) {
+                    Ok(p) => p.external,
+                    Err(e) => {
+                        toast(&self.window, format!("领域 {id} 装载失败：{e}"));
+                        return;
+                    }
+                };
+                if idx >= decls.len() {
+                    toast(&self.window, format!("第 {idx} 条外部工具不存在（共 {} 条）", decls.len()));
+                    return;
+                }
+                let gone = decls.remove(idx);
+                match wpa_engine::domain::set_external(&file, &decls) {
+                    Ok(()) => {
+                        self.reload_tree();
+                        toast(
+                            &self.window,
+                            format!("已移除外部工具：{}（剩 {} 条）", gone.display_name(), decls.len()),
+                        );
+                    }
+                    Err(e) => toast(&self.window, format!("写入失败：{e}")),
+                }
             }
             Cmd::DomainSaveGroups => {
                 let Some((id, groups)) = self.domain_edit.clone() else {
@@ -1882,6 +2210,44 @@ impl Engine {
                 ui_set(&self.window, move |app| {
                     app.set_sessions(ModelRc::new(VecModel::from(rows)));
                 });
+            }
+            Cmd::SessionView(id) => {
+                // 只读预览：把这条会话的消息拉到会话页右侧面板。
+                // 刻意不碰 self.session / 不重建引擎会话——「看」和「切」是两件事，
+                // 预览顺手覆盖掉用户正在写的对话是最容易惹人烦的失败模式。
+                let Some(store) = self.base.sessions.as_ref() else { return };
+                let Some(rec) = store.get(&id) else {
+                    toast(&self.window, format!("未找到会话 {id}"));
+                    return;
+                };
+                let lines = if let Some(st) = &rec.state { &st.messages } else { &rec.messages };
+                let title = if rec.title.is_empty() { id.clone() } else { rec.title.clone() };
+                let space = if rec.workspace.is_empty() { "全局".to_string() } else { rec.workspace.clone() };
+                let meta = format!(
+                    "{} 轮 · 更新于 {} · 空间 {}",
+                    rec.turns,
+                    format_time(rec.updated_ms),
+                    space
+                );
+                let msgs: Vec<ChatMsg> = lines
+                    .iter()
+                    .filter_map(|m| {
+                        let role = match m.role {
+                            0 => "user",
+                            1 => "assistant",
+                            3 => "system",
+                            _ => return None,
+                        };
+                        Some(ChatMsg { role: role.into(), text: m.text.clone().into() })
+                    })
+                    .collect();
+                let n = msgs.len();
+                ui_set(&self.window, move |app| {
+                    app.set_session_view(ModelRc::new(VecModel::from(msgs)));
+                    app.set_session_view_title(title.into());
+                    app.set_session_view_meta(meta.into());
+                });
+                toast(&self.window, format!("预览会话「{id}」：{n} 条消息（未切换当前对话）"));
             }
             Cmd::SessionOpen(id) => {
                 // 真正切换会话：读完整记录 → 重建会话 → 恢复协议历史/轮次 → 续写原记录。
@@ -2016,6 +2382,91 @@ impl Engine {
                 match wpa_engine::domain::write_domain_file(&root, &id, &file, &text) {
                     Ok(()) => toast(&self.window, format!("已保存 {file}")),
                     Err(e) => toast(&self.window, format!("保存失败：{e}")),
+                }
+            }
+
+            // 领域概要（≤300 字）：只改 domain.toml 的 summary 一行
+            Cmd::DomainSummarySave { id, summary } => {
+                let root = self.base.cfg.domains_root();
+                match wpa_engine::domain::set_summary(&root, &id, &summary) {
+                    Ok(()) => {
+                        self.reload_tree();
+                        toast(&self.window, format!("领域 {id} 的概要已保存"));
+                    }
+                    Err(e) => toast(&self.window, format!("保存概要失败：{e}")),
+                }
+            }
+
+            // AI 生成领域配置：概要 → 模型 → 四份文件（原文件 .bak 备份 + 装载校验 + 失败回滚）
+            Cmd::DomainAiGenerate { id, summary } => {
+                let root = self.base.cfg.domains_root();
+                let dir = root.join(&id);
+                let pack = match wpa_engine::domain::load(&dir) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        toast(&self.window, format!("装载领域失败：{e}"));
+                        return;
+                    }
+                };
+                // 用编辑框里的当前文本；它是空的才回落到已保存的概要
+                let summary = if summary.trim().is_empty() {
+                    pack.manifest.summary.trim().to_string()
+                } else {
+                    summary.trim().to_string()
+                };
+                if summary.is_empty() {
+                    toast(&self.window, "领域概要为空：先在上面的概要框写清需求，再让 AI 生成");
+                    return;
+                }
+                if summary.chars().count() > wpa_engine::domain::SUMMARY_MAX_CHARS {
+                    toast(
+                        &self.window,
+                        format!(
+                            "领域概要超过 {} 字，生成前请先压缩",
+                            wpa_engine::domain::SUMMARY_MAX_CHARS
+                        ),
+                    );
+                    return;
+                }
+                // 用当前生效的模型；没有就是「无法操作」，不做离线兜底
+                let profile = self
+                    .cfg
+                    .llm
+                    .active_profile()
+                    .cloned()
+                    .or_else(|| self.cfg.llm.resolve_chain(None).into_iter().next());
+                let Some(profile) = profile else {
+                    toast(
+                        &self.window,
+                        "无法生成：没有可用的模型。请先在「配置 · 模型」启用一个档案（填 base_url 与模型名）",
+                    );
+                    return;
+                };
+                let (system, user) = wpa_engine::domain::gen_prompt(&pack, &summary);
+                ui_set(&self.window, |app| app.set_ai_busy(true));
+                let provider_cfg = profile.to_provider_config();
+                let outcome = (|| -> Result<Vec<String>, String> {
+                    let provider = base_llm::build_provider(provider_cfg)
+                        .map_err(|e| format!("构造模型调用失败：{e}"))?;
+                    let msgs = vec![base_llm::system_message(system), base_llm::user_message(user)];
+                    let done = self
+                        .rt
+                        .block_on(provider.complete(&msgs, &[]))
+                        .map_err(|e| format!("调用模型失败：{e}"))?;
+                    let raw = done.content.unwrap_or_default();
+                    let json = wpa_engine::domain::extract_json_object(&raw)?;
+                    wpa_engine::domain::apply_generated(&dir, &json)
+                })();
+                ui_set(&self.window, |app| app.set_ai_busy(false));
+                match outcome {
+                    Ok(files) => {
+                        self.reload_tree();
+                        toast(
+                            &self.window,
+                            format!("已生成并替换：{}（原文件备份为 .bak）", files.join("、")),
+                        );
+                    }
+                    Err(e) => toast(&self.window, format!("生成失败：{e}")),
                 }
             }
 
