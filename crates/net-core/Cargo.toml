@@ -3,7 +3,7 @@ name = "net-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "基座网络原语：TCP 探测 / banner / DNS 报文 / HTTP（自研，不依赖外部程序）"
 
 [dependencies]

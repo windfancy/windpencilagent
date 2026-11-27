@@ -3,7 +3,7 @@ name = "data-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "基座数据原语：本地 sqlite 与向量库的读写工具（知识读写组 kb）"
 
 [dependencies]

@@ -31,7 +31,10 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.92"
-license = "MIT"
+# 非商业许可：个人/研究/教学免费，商业用途需事先书面授权。
+# 见根目录 LICENSE。Cargo 不接受自定义 SPDX 标识符，故用 license-file
+# 指向全文；子 crate 通过 `license-file.workspace = true` 继承。
+license-file = "LICENSE"
 authors = ["windpencilagent Team"]
 
 [workspace.dependencies]
