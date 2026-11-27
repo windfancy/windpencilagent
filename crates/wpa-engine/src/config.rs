@@ -568,6 +568,24 @@ pub enum ConfigSection {
 }
 
 impl ConfigSection {
+    /// 全部配置域（「保存配置」按钮用：全量校验 + 全量写盘）。
+    pub const ALL: [ConfigSection; 14] = [
+        ConfigSection::App,
+        ConfigSection::Theme,
+        ConfigSection::Llm,
+        ConfigSection::Memory,
+        ConfigSection::Context,
+        ConfigSection::Agent,
+        ConfigSection::Run,
+        ConfigSection::Scope,
+        ConfigSection::Sandbox,
+        ConfigSection::Plugin,
+        ConfigSection::Net,
+        ConfigSection::Logging,
+        ConfigSection::Domain,
+        ConfigSection::Tree,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             ConfigSection::App => "app",
@@ -664,12 +682,17 @@ impl AppConfig {
         toml::from_str(&raw).map_err(|e| format!("解析 config.toml 失败：{e}"))
     }
 
-    /// 保存（原子写：先写 .tmp 再 rename），保存前跑 [`Self::validate`]。
+    /// 保存（原子写：先写 .tmp 再 rename），保存前跑 [`Self::validate`] 全量校验。
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let errs = self.validate();
         if !errs.is_empty() {
             return Err(format!("配置校验失败：\n  {}", errs.join("\n  ")));
         }
+        self.write_atomic(path)
+    }
+
+    /// 原子写本体（不带校验）：先写 .tmp 再 rename，避免半截文件。
+    fn write_atomic(&self, path: &Path) -> Result<(), String> {
         let text = toml::to_string_pretty(self).map_err(|e| format!("序列化配置失败：{e}"))?;
         if let Some(dir) = path.parent() {
             if !dir.as_os_str().is_empty() {
@@ -682,11 +705,30 @@ impl AppConfig {
         Ok(())
     }
 
-    /// 带回执的保存：校验 → 原子写 → 返回 [`ChangeSet`]（G-3 配置变更事件）。
+    /// 带回执的保存：按本次涉及的域校验 → 原子写 → 返回 [`ChangeSet`]（G-3 配置变更事件）。
     ///
-    /// 调用方把 `domains` 声明清楚，订阅方（UI/引擎）据此各自动自己的热更新。
+    /// 只校验 `domains` 覆盖的域：局部编辑不该被文件里别处的存量错误卡住
+    /// （那正是"改任意输入框都保存失败"的根因）。调用方把 `domains` 声明清楚，
+    /// 订阅方（UI/引擎）据此各自动自己的热更新。
     pub fn commit(&self, path: &Path, domains: &[ConfigSection]) -> Result<ChangeSet, String> {
-        self.save(path)?;
+        let errs: Vec<String> = self
+            .validate()
+            .into_iter()
+            .filter(|e| {
+                let sec = e
+                    .strip_prefix('[')
+                    .and_then(|s| s.split_once(']'))
+                    .map(|(s, _)| s)
+                    .unwrap_or("");
+                domains.iter().any(|d| {
+                    sec == d.as_str() || sec.starts_with(&format!("{}.", d.as_str()))
+                })
+            })
+            .collect();
+        if !errs.is_empty() {
+            return Err(format!("配置校验失败：\n  {}", errs.join("\n  ")));
+        }
+        self.write_atomic(path)?;
         Ok(ChangeSet::new(domains))
     }
 
@@ -862,6 +904,22 @@ impl AppConfig {
         // 领域
         if self.domain.active.trim().is_empty() {
             errs.push("[domain].active 不能为空（缺省 default）".into());
+        }
+        // 拒绝清单：写错的条目会让 ScopeGuard fail-closed 拒绝**一切**带目标操作
+        // （见 kern-core::ScopeGuard::check_target 的第一道判定），落盘等于把用户锁死：
+        // 之后无论怎么加授权范围、怎么在界面上点审批，工具调用都过不去。
+        // 所以这类值必须在保存前拦下。授权条目写错只是少授权，由装配期提示即可，不阻塞保存。
+        for raw in &self.scope.denylist {
+            let t = raw.trim();
+            if t.is_empty() {
+                continue; // 输入框里的空行很常见，装配期会跳过，不算写错
+            }
+            if !matches!(kern_core::ScopeRule::parse(t), Ok(r) if r.is_effective()) {
+                errs.push(format!(
+                    "[scope.denylist] 条目 `{t}` 无法生效：拒绝清单写错会拒绝一切带目标操作，\
+                     请填 IP（10.0.0.5）、网段（10.0.0.0/24）或域名（example.com），或删掉这一条"
+                ));
+            }
         }
         errs
     }
@@ -1170,6 +1228,46 @@ mod tests {
         assert!(!cfg.run.auto_approve);
         assert_eq!(cfg.app.theme, "light");
         assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn validate_rejects_broken_denylist_entry() {
+        // 拒绝清单写错会让 ScopeGuard fail-closed 拒绝一切带目标操作，
+        // 这种值一旦落盘用户就再也调不动工具，必须在保存闸门处拦下。
+        let mut cfg: AppConfig = toml::from_str(SAMPLE_CONFIG).unwrap();
+        cfg.scope.denylist = vec!["·".into()];
+        let errs = cfg.validate();
+        assert!(
+            errs.iter().any(|e| e.starts_with("[scope.denylist]")),
+            "{errs:?}"
+        );
+
+        // 合法条目放行：IP / 网段 / 域名 / 空行
+        cfg.scope.denylist = vec![
+            "10.0.0.5".into(),
+            "10.0.0.0/24".into(),
+            "example.com".into(),
+            "  ".into(),
+        ];
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn broken_denylist_blocks_only_scope_section() {
+        // 分区校验：坏条目只卡 scope 域，不牵连别的页面（否则用户改字体也存不下去）
+        let mut cfg: AppConfig = toml::from_str(SAMPLE_CONFIG).unwrap();
+        cfg.scope.denylist = vec!["·".into()];
+        let scope_errs: Vec<String> = cfg
+            .validate()
+            .into_iter()
+            .filter(|e| e.starts_with("[scope"))
+            .collect();
+        assert!(!scope_errs.is_empty(), "scope 域应被拦");
+        assert!(
+            !cfg.validate().iter().any(|e| e.starts_with("[app]")),
+            "app 域不应受影响：{:?}",
+            cfg.validate()
+        );
     }
 
     #[test]

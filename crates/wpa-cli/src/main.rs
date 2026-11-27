@@ -758,7 +758,7 @@ enum RegOp {
 }
 
 fn registry_file(cfg: &AppConfig) -> PathBuf {
-    wpa_engine::registry::registry_path(&cfg.data_root())
+    wpa_engine::registry::domain_registry_path(&cfg.data_root(), &cfg.domain.active)
 }
 
 fn registry_list(cfg: &AppConfig) -> anyhow::Result<()> {

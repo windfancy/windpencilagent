@@ -853,6 +853,20 @@ pub fn registry_path(data_root: &Path) -> PathBuf {
     data_root.join("registry.toml")
 }
 
+/// 领域独立注册表路径。
+///
+/// 背景：旧版只有一份全局 `<data>/registry.toml`，切换领域时所有组开关/装卸状态
+/// 共用同一份账本，导致"领域 A 关掉的组在领域 B 也关着"。改为每个领域一份
+/// `<data>/registries/<domain_id>/registry.toml`，切换领域 = 装配时加载对应账本。
+///
+/// 兼容：`default` 领域（含空 id）继续用旧全局 `registry.toml`，老用户配置不丢。
+pub fn domain_registry_path(data_root: &Path, domain_id: &str) -> PathBuf {
+    match domain_id.trim() {
+        "" | "default" => registry_path(data_root),
+        id => data_root.join("registries").join(id).join("registry.toml"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

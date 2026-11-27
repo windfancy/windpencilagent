@@ -90,12 +90,28 @@ fn run_inner(config_path: PathBuf) -> anyhow::Result<()> {
     // 审批裁决（同时关闭浮层）
     {
         let h = handle.approval.clone();
+        let cmd = handle.tx.clone();
         let weak = app.as_weak();
-        app.on_approve(move |allow| {
+        // choice: 0=拒绝 1=本次放行 2=本轮会话生效 3=加入空间授权白名单
+        app.on_approve(move |choice| {
+            let allow = choice != 0;
             if let Ok(mut slot) = h.lock() {
                 if let Some(tx) = slot.take() {
                     let _ = tx.send(allow);
                 }
+            }
+            let tool = weak
+                .upgrade()
+                .map(|a| a.get_approval_tool().to_string())
+                .unwrap_or_default();
+            if choice == 2 {
+                let _ = cmd.send(Cmd::ApprovalGrantSession(tool));
+            } else if choice == 3 {
+                let args = weak
+                    .upgrade()
+                    .map(|a| a.get_approval_args().to_string())
+                    .unwrap_or_default();
+                let _ = cmd.send(Cmd::ApprovalGrantSpace(args));
             }
             if let Some(app) = weak.upgrade() {
                 app.set_approval_open(false);
@@ -179,7 +195,7 @@ fn run_inner(config_path: PathBuf) -> anyhow::Result<()> {
             let _ = h.send(Cmd::SetScope(rules));
         });
     }
-    // 内置能力配置卡片：改一项保存一项（无效值会被引擎拒绝并在提示条说明原因）
+    // 内置能力配置卡片：按钮/开关即时落盘（无效值会被引擎拒绝并在提示条说明原因）
     {
         let h = handle.tx.clone();
         app.on_cfg_edit(move |key, value| {
@@ -187,6 +203,22 @@ fn run_inner(config_path: PathBuf) -> anyhow::Result<()> {
                 key: key.to_string(),
                 value: value.to_string(),
             });
+        });
+    }
+    // 文本/列表逐字草稿：只进内存，点「保存配置」统一落盘
+    {
+        let h = handle.tx.clone();
+        app.on_cfg_draft(move |key, value| {
+            let _ = h.send(Cmd::DraftField {
+                key: key.to_string(),
+                value: value.to_string(),
+            });
+        });
+    }
+    {
+        let h = handle.tx.clone();
+        app.on_cfg_save(move || {
+            let _ = h.send(Cmd::SaveConfig);
         });
     }
     {
@@ -366,10 +398,19 @@ fn run_inner(config_path: PathBuf) -> anyhow::Result<()> {
             }
         });
     }
+    // 空间工具组勾选（按组授权）
+    {
+        let h = handle.tx.clone();
+        app.on_space_pick(move |name| { let _ = h.send(Cmd::SpacePick(name.to_string())); });
+    }
+    {
+        let h = handle.tx.clone();
+        app.on_space_group_toggle(move |id| { let _ = h.send(Cmd::SpaceToggleGroup(id.to_string())); });
+    }
     // 会话管理
     {
         let h = handle.tx.clone();
-        app.on_session_list(move || { let _ = h.send(Cmd::SessionList); });
+        app.on_session_list(move |filter| { let _ = h.send(Cmd::SessionList(filter.to_string())); });
     }
     {
         let h = handle.tx.clone();

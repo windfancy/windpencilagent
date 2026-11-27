@@ -269,6 +269,9 @@ pub struct ChatSession {
     sessions: Option<Arc<base_store::SessionStore>>,
     /// 本会话在会话库里的记录 id（首轮写入时创建；None = 还没落过盘）
     persist_id: Option<String>,
+    /// 本会话归属的空间/模型档案（落盘时用；会话列表按空间分类）
+    persist_space: String,
+    persist_profile: String,
     /// 工作区根（R5-4，AGENTS.md 两级发现的工作区级；None=仅全局级）
     workspace_root: Option<std::path::PathBuf>,
     /// 插件前置钩子链（R3-1，dsh guard 语义）：denylist 后、审批前裁决
@@ -317,6 +320,8 @@ impl ChatSession {
             goals: None,
             sessions: None,
             persist_id: None,
+            persist_space: String::new(),
+            persist_profile: String::new(),
             workspace_root: None,
             hooks: Vec::new(),
             repeat_key: None,
@@ -356,6 +361,48 @@ impl ChatSession {
         self
     }
 
+    /// 设置会话归属（空间/模型档案）：落盘时写入 SessionRecord，供会话列表按空间分类。
+    pub fn set_persist_identity(&mut self, space: impl Into<String>, profile: impl Into<String>) {
+        self.persist_space = space.into();
+        self.persist_profile = profile.into();
+    }
+
+    /// 绑定到一个已存在的会话记录（打开历史会话时）：后续轮次续写原记录。
+    pub fn set_persist_id(&mut self, id: Option<String>) {
+        self.persist_id = id;
+    }
+
+    /// 把一条已落盘的会话记录还原成完整协议快照（打开历史会话用）。
+    pub fn session_snapshot(rec: &base_store::SessionRecord) -> ChatSnapshot {
+        let conv = |msgs: &[base_store::StoredMessage]| -> Vec<ChatMessage> {
+            msgs.iter()
+                .map(|m| {
+                    let role = match m.role {
+                        1 => ChatRole::Assistant,
+                        3 => ChatRole::System,
+                        5 => ChatRole::Tool,
+                        _ => ChatRole::User, // 0=user；2=轨迹、4=轮次分隔按用户文本展示
+                    };
+                    let tool_calls = m
+                        .tool_calls
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str(s).ok());
+                    ChatMessage { role, content: m.text.clone(), tool_calls, tool_call_id: m.tool_call_id.clone() }
+                })
+                .collect()
+        };
+        if let Some(st) = &rec.state {
+            ChatSnapshot {
+                history: conv(&st.messages),
+                rolling_summary: st.rolling_summary.clone(),
+                archived: conv(&st.archived),
+            }
+        } else {
+            // 旧记录：只有展示行，没有结构化 state
+            ChatSnapshot { history: conv(&rec.messages), rolling_summary: None, archived: Vec::new() }
+        }
+    }
+
     /// 把本轮对话写进会话库。
     ///
     /// 为什么放在 `turn()` 而不是"退出时整段保存"：进程可能被直接关掉（窗口关、
@@ -369,7 +416,11 @@ impl ChatSession {
         };
         let id = match self.persist_id.clone() {
             Some(id) => id,
-            None => match store.create(&base_store::SessionRecord::title_from(input), "", "") {
+            None => match store.create(
+                &base_store::SessionRecord::title_from(input),
+                &self.persist_space,
+                &self.persist_profile,
+            ) {
                 Ok(rec) => {
                     self.persist_id = Some(rec.id.clone());
                     rec.id
@@ -1131,25 +1182,39 @@ impl ChatSession {
                 "error": "目标命中拒绝清单（授权范围中排除的目标），禁止对该目标调用任何工具"
             }).to_string());
         }
-        // 授权范围硬校验（ScopeGuard）：带目标的调用必须落在白名单内。
-        // 这是执行层的红线，不依赖 LLM / 规划器自觉；空授权范围 = 带目标一律拒绝。
+        // 授权范围校验（ScopeGuard）：带目标的调用不在白名单内时，不再硬拒绝 +
+        // "让用户自己去配置里开"，而是发审批请求让用户当场授权（本次/本轮/空间白名单）。
+        // 注意：denylist 命中在前面已硬拒绝，这里只处理"未显式授权"这类可当场批准的情况。
         if let Some(reason) = scope_denial(&self.cfg.authorized_scope, &self.cfg.denylist, &args) {
-            trace.push(format!("[FAIL] {tool}（{reason}）"));
-            self.emit(ChatEvent::ToolFinished {
+            self.emit(ChatEvent::ApprovalRequested {
                 tool: tool.to_string(),
-                ok: false,
-                summary: reason.clone(),
-                duration_ms: 0,
-                detail: String::new(),
+                risk: "OutOfScope".into(),
+                args_summary: format!("{reason}｜参数：{}", summarize_args(&args)),
             });
-            return Prepared::Denied(
-                json!({
-                    "ok": false,
-                    "error": reason,
-                    "hint": "只能操作授权范围内的目标；如需扩大范围，请让用户在配置或空间里显式加入"
-                })
-                .to_string(),
-            );
+            let allowed = match self.approval_mode {
+                Some(v) => v,
+                None if self.session_allowlist.contains(tool) => true,
+                None => (self.approval)(tool, RiskLevel::High, &reason),
+            };
+            self.emit(ChatEvent::ApprovalDecision {
+                tool: tool.to_string(),
+                allowed,
+                via: "scope-approval".into(),
+            });
+            if !allowed {
+                trace.push(format!("[FAIL] {tool}（授权范围外，审批未通过：{reason}）"));
+                self.emit(ChatEvent::ToolFinished {
+                    tool: tool.to_string(),
+                    ok: false,
+                    summary: reason.clone(),
+                    duration_ms: 0,
+                    detail: String::new(),
+                });
+                return Prepared::Denied(
+                    json!({ "ok": false, "error": reason, "via": "scope-approval-denied" }).to_string(),
+                );
+            }
+            trace.push(format!("[OK] {tool}（授权范围外，用户当场批准）"));
         }
         // 插件前置钩子（R3-1，dsh guard 语义）：denylist 之后、审批之前。
         // Deny=硬拦截（不进审批）；Ask=视同需审批（即使工具风险低于阈值也走审批链）。
@@ -2247,6 +2312,10 @@ mod tests {
         true
     }
 
+    fn deny_all(_: &str, _: RiskLevel, _: &str) -> bool {
+        false
+    }
+
     #[tokio::test]
     async fn llm_react_loop_completes() {
         let provider: Arc<dyn LlmProvider> = Arc::new(ScriptProvider {
@@ -3200,15 +3269,17 @@ mod tests {
 
     #[tokio::test]
     async fn scope_guard_blocks_out_of_scope_target() {
-        // 真漏洞回归：授权范围内才放行，范围外必须在执行前拦下。
-        let mut s = session(None, Arc::new(allow_all));
+        // 安全回归：授权范围外的目标必须弹审批；审批拒绝则不执行。
+        // （本版按诉求改为「超授权走审批」而非硬拒绝，用户可当场授权；
+        //   deny_all 模拟用户点「拒绝」，验证仍拦得住。）
+        let mut s = session(None, Arc::new(deny_all));
         s.cfg.authorized_scope = vec!["10.0.0.0/24".into()];
         let mut trace = Vec::new();
         let obs = s
             .run_tool("util.echo", r#"{"host":"192.168.1.16"}"#, &mut trace)
             .await;
         assert!(obs.contains("未通过授权校验"), "{obs}");
-        // 范围内照常执行
+        // 范围内照常执行（不触发审批）
         let obs2 = s
             .run_tool("util.echo", r#"{"host":"10.0.0.8"}"#, &mut trace)
             .await;

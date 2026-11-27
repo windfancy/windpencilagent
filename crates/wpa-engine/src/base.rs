@@ -208,10 +208,11 @@ pub async fn assemble(cfg: &AppConfig, _cli_tree: Option<PathBuf>) -> anyhow::Re
     let jobs = JobStore::new();
     let mut warnings = Vec::new();
 
-    // 注册表（`<data>/registry.toml`）：能力的唯一真相源。
+    // 注册表（领域独立）：能力的唯一真相源。切换领域即加载该领域自己的账本，
+    // 组开关/装卸状态互不干扰；default 领域兼容旧全局 registry.toml。
     // 首次运行按 `catalog::BUILTIN_SPECS` 生成（内置工具全部 installed+enabled）。
     let data_root = cfg.data_root();
-    let reg_path = crate::registry::registry_path(&data_root);
+    let reg_path = crate::registry::domain_registry_path(&data_root, &cfg.domain.active);
     let (mut tool_reg, reg_created) = crate::registry::ToolRegistry::load_or_init(&reg_path)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if reg_created {

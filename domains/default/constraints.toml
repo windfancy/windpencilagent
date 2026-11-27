@@ -25,20 +25,23 @@ tools = ["shell.run", "shell.*", "os.*", "proc.*"]
 min_risk = "high"
 
 # --- 2. 凭据不外传 -----------------------------------------------------------
+# 修复：原 tools=["net.*",...] + min_risk=medium 会把普通端口扫描（net.scan 端口>200
+# 即 medium）一律硬拦。改为只盯"真正会外发数据"的工具，且必须命中凭据类目标子串
+# 才拦；纯扫描/探测交给风险审批机制，不由知识约束硬拒绝。
 [[constraint]]
 id = "gen.no-credential-egress"
 text = "不要把凭据类文件的内容发到任何外部地址：.env、id_rsa/id_ed25519 等私钥、*.pem/*.pfx、浏览器 Cookie/Login Data 库、云厂商 AccessKey、数据库连接串。读取本机这些文件用于本地诊断时，输出必须打码（只留前后各 2 位）。"
 severity = "must"
-tools = ["net.*", "web.*", "http.*", "ftp.*"]
-min_risk = "medium"
+tools = ["http.post", "http.put", "ftp.upload", "web.upload", "net.upload", "file.upload"]
+target_contains = [".env", "id_rsa", "id_ed25519", ".pem", ".pfx", "cookie", "login data", "accesskey", "secret"]
 
 # --- 3. 对外发送需确认 -------------------------------------------------------
+# 同上：只约束"写入型外发工具"，不碰 net.scan 这类只读扫描。
 [[constraint]]
 id = "gen.no-outbound-without-approval"
 text = "对外发送任何内容（发消息、发邮件、提交 PR、调第三方写接口、上传文件）前，必须把「发给谁、发什么、能不能撤回」说清楚并得到确认。不要把用户的本地数据当成可以自由外发的素材。"
-severity = "must"
-tools = ["net.*", "web.*", "http.*"]
-min_risk = "medium"
+severity = "should"
+tools = ["http.post", "http.put", "ftp.upload", "web.upload", "net.upload", "file.upload", "web.send", "mail.send"]
 
 # --- 4. 系统配置不静默修改 ---------------------------------------------------
 [[constraint]]

@@ -49,6 +49,19 @@ pub enum Cmd {
     SetScope(Vec<String>),
     /// 修改内置能力配置项（key, value）：校验 → 写盘 → 按分区决定热更新或提示重启
     SetField { key: String, value: String },
+    /// 文本输入草稿：只改内存配置，不写盘 —— 等「保存配置」按钮统一落盘。
+    /// 逐键写盘会让每次击键都跑校验/重建会话，且非法中间值（如 "-"）会被当场回滚。
+    DraftField { key: String, value: String },
+    /// 「保存配置」：全量校验 → 写盘 → 同步装配快照 → 刷新界面。
+    SaveConfig,
+    /// 空间编辑：点「编辑」时初始化组勾选 chips
+    SpacePick(String),
+    /// 空间编辑：勾选/取消一个工具组（按组授权，替代手输白名单）
+    SpaceToggleGroup(String),
+    /// 审批「本轮会话生效」：把工具加入当前会话白名单
+    ApprovalGrantSession(String),
+    /// 审批「加入空间授权白名单」：参数=审批参数摘要（含目标 JSON），解析目标写入当前空间 scope 并持久化
+    ApprovalGrantSpace(String),
     /// 能力页选中条目：按名字查快照，把详情回填给界面（界面不做循环过滤）
     PickTool(String),
     /// 能力页注册表操作：(id, op)，写 registry.toml 后重新装配
@@ -97,8 +110,8 @@ pub enum Cmd {
         approval: String,
         sandbox: String,
     },
-    /// #9.1 会话管理
-    SessionList,
+    /// #9.1 会话管理（参数=空间过滤，空串=全部）
+    SessionList(String),
     SessionOpen(String),
     SessionDelete(String),
     SessionExport(String),
@@ -222,6 +235,8 @@ fn push_trace(
     };
     ui_set(window, move |app| {
         app.set_traces(ModelRc::new(VecModel::from(data)));
+        // 轨迹新增后自动滚到底部（viewport-y 超出范围由 Slint clamp）
+        app.set_trace_scroll_y(1e7);
     });
 }
 
@@ -244,6 +259,8 @@ fn push_msg(
     };
     ui_set(window, move |app| {
         app.set_messages(ModelRc::new(VecModel::from(data)));
+        // 新消息到达后自动滚到底部（用户手动上翻只在下次新消息时被拉回，符合聊天习惯）
+        app.set_chat_scroll_y(1e7);
     });
 }
 
@@ -356,6 +373,35 @@ fn publish_cfg_cards(app: &AppWindow, cfg: &AppConfig) {
 }
 
 impl Engine {
+    /// 下发空间页的工具组勾选 chips（全部基座组 + 当前空间已选）。
+    fn push_space_group_chips(&self) {
+        let snap = self.base.snapshot();
+        let chips: Vec<DomainGroupChip> = snap
+            .cap_groups
+            .iter()
+            .map(|g| DomainGroupChip {
+                id: g.id.clone().into(),
+                label: g.label.clone().into(),
+                declared: self.space_group_edit.iter().any(|x| x == &g.id),
+            })
+            .collect();
+        let whitelist = self.space_group_edit.join("\n");
+        ui_set(&self.window, move |app| {
+            app.set_space_group_chips(ModelRc::new(VecModel::from(chips)));
+            app.set_edit_whitelist(whitelist.into());
+        });
+    }
+
+    /// 配置写盘后，把最新配置同步进装配期 Base 快照。
+    ///
+    /// 根因修复：`Base.cfg` 是 `assemble` 时的快照，而 `apply_snapshot` 用它下发布尔/
+    /// 数值卡片、`base.models()` 用它算模型列表、`build_session` 用它构建会话。
+    /// 若只改 `self.cfg` 不回灌，界面会被 `apply_snapshot` 用旧值二次覆盖（看起来"改了没保存"），
+    /// 且会话/模型切换读的还是旧快照（看起来"要重启才生效"）。写盘成功后统一回灌即可。
+    fn sync_base_cfg(&mut self) {
+        self.base.cfg = self.cfg.clone();
+    }
+
     /// 下发领域页的组 chips：全部基座组 + 内存编辑态的勾选标记。
     ///
     /// 编辑态为空（还没选中领域 / 刚保存）时按"选中领域的声明"显示，不标 dirty。
@@ -665,6 +711,8 @@ struct Engine {
     window: slint::Weak<AppWindow>,
     /// 领域页的组绑定编辑态：Some((领域 id, 组集合))。勾选只改这里，保存才落盘。
     domain_edit: Option<(String, Vec<String>)>,
+    /// 空间页的工具组勾选编辑态：当前已选组 id 集合（对应 SpaceRow.whitelist）
+    space_group_edit: Vec<String>,
     session: Option<ChatSession>,
     info: Option<SessionInfo>,
     ui: UiData,
@@ -672,8 +720,6 @@ struct Engine {
     /// 本进程累计用量（状态条展示；空间级持久记账另有 record_usage）
     tokens_in: u64,
     tokens_out: u64,
-    /// 会话列表的空间过滤器（点空间"编辑"时设置）
-    session_filter: String,
 }
 
 /// 毫秒时间戳 → 本地时间字符串（会话列表用）。
@@ -741,6 +787,7 @@ fn run_engine(
 
     let mut engine = Engine {
         domain_edit: None,
+        space_group_edit: Vec::new(),
         tokens_in: 0,
         tokens_out: 0,
         rt,
@@ -752,7 +799,6 @@ fn run_engine(
         info: None,
         ui: UiData::new(),
         approval,
-        session_filter: String::new(),
     };
 
     apply_snapshot(&engine.base, &window);
@@ -938,7 +984,16 @@ impl Engine {
                 .map(|w| w.approval(self.cfg.run.auto_approve))
                 .unwrap_or(self.cfg.run.auto_approve),
         };
-        let (session, info) = build_session(&self.base, opts);
+        let (mut session, info) = build_session(&self.base, opts);
+        // 会话归属：落盘时写入 SessionRecord，会话列表据此按空间分类
+        let space = self
+            .base
+            .workspaces
+            .active()
+            .map(|w| w.name.clone())
+            .unwrap_or_default();
+        let profile = self.cfg.llm.active.clone().unwrap_or_default();
+        session.set_persist_identity(space, profile);
         self.session = Some(session);
         self.info = Some(info);
     }
@@ -1031,10 +1086,14 @@ impl Engine {
                 Err(e) => toast(&self.window, format!("移除失败：{e}")),
             },
             Cmd::UseModel(name) => {
+                let old = self.cfg.llm.active.clone();
                 self.cfg.llm.active = Some(name.clone());
                 match self.cfg.commit(&self.cfg_path, &[ConfigSection::Llm]) {
                     Ok(cs) => {
-                        // llm 域是热更新域：重建会话即可让新档案与降级链生效
+                        // 关键：先把新配置回灌进 Base 快照，再重建会话/刷新界面。
+                        // 否则 build_session 读 base.cfg 旧值、模型列表也被旧快照覆盖，
+                        // 表现为"切了模型要重启才生效"。
+                        self.sync_base_cfg();
                         self.session = None;
                         self.ensure_session();
                         apply_snapshot(&self.base, &self.window);
@@ -1043,7 +1102,10 @@ impl Engine {
                         }
                         toast(&self.window, format!("已启用模型档案 {name} · {}", cs.describe()));
                     }
-                    Err(e) => toast(&self.window, format!("保存配置失败：{e}")),
+                    Err(e) => {
+                        self.cfg.llm.active = old;
+                        toast(&self.window, format!("保存配置失败：{e}"));
+                    }
                 }
             }
             Cmd::NewModel => {
@@ -1333,6 +1395,9 @@ impl Engine {
                     .unwrap_or(ConfigSection::App);
                 match self.cfg.commit(&self.cfg_path, &[section]) {
                     Ok(cs) => {
+                        // 关键：先把新配置回灌进 Base 快照。apply_snapshot 用它下发布尔/数值
+                        // 卡片，build_session 用它构建会话 —— 不回灌就会被旧值二次覆盖。
+                        self.sync_base_cfg();
                         // 热更新：主题/字号当场生效（其余分区靠重建会话或重启）
                         if self.cfg.app.theme != old_theme || self.cfg.app.font_size != old_font {
                             let dark = self.cfg.app.theme == "dark";
@@ -1362,6 +1427,109 @@ impl Engine {
                         apply_snapshot(&self.base, &self.window);
                     }
                     Err(e) => toast(&self.window, format!("保存失败：{e}")),
+                }
+            }
+            Cmd::DraftField { key, value } => {
+                // 只写内存草稿，不写盘、不重建会话、不 toast —— 逐字输入不该每次击键
+                // 都跑一遍校验/会话重建。点「保存配置」时再统一校验落盘。
+                if let Err(e) = self.cfg.set_field(&key, &value) {
+                    // 非法中间值（例如刚敲了个 "-"）：静默保留 UI 里的文本，等保存时报错
+                    let _ = e;
+                }
+                ui_set(&self.window, |app| {
+                    app.set_cfg_note("● 有未保存的修改，点「保存配置」生效".into());
+                });
+            }
+            Cmd::SaveConfig => {
+                let errs = self.cfg.validate();
+                if !errs.is_empty() {
+                    toast(&self.window, format!("未保存：{}", errs.join("；")));
+                    return;
+                }
+                match self.cfg.commit(&self.cfg_path, &ConfigSection::ALL) {
+                    Ok(cs) => {
+                        self.sync_base_cfg();
+                        // 热域改动重建会话，让新值下一轮就生效
+                        self.rebuild_session();
+                        apply_snapshot(&self.base, &self.window);
+                        if let Some(info) = self.info.clone() {
+                            self.apply_info(&info);
+                        }
+                        ui_set(&self.window, move |app| app.set_cfg_note(cs.describe().into()));
+                        toast(&self.window, "配置已保存到 config.toml");
+                    }
+                    Err(e) => toast(&self.window, format!("保存失败：{e}")),
+                }
+            }
+            Cmd::SpacePick(name) => {
+                let Some(w) = self.base.workspaces.get(&name) else { return };
+                // 已有白名单：组 id 直接保留；精确工具名也保留（chips 只显示组）
+                self.space_group_edit = w.plugins.clone();
+                self.push_space_group_chips();
+            }
+            Cmd::SpaceToggleGroup(gid) => {
+                match self.space_group_edit.iter().position(|x| x == &gid) {
+                    Some(i) => { self.space_group_edit.remove(i); }
+                    None => self.space_group_edit.push(gid.clone()),
+                }
+                self.push_space_group_chips();
+            }
+            Cmd::ApprovalGrantSession(tool) => {
+                if let Some(s) = self.session.as_mut() {
+                    s.allow_tool(&tool);
+                }
+                toast(&self.window, format!("工具 {tool} 已加入本轮会话白名单"));
+            }
+            Cmd::ApprovalGrantSpace(text) => {
+                // 从审批参数摘要里提取目标（target/host/url），写入当前空间 scope 并持久化。
+                // 提取失败时退回整段文本，由用户后续在配置页修正。
+                let target = {
+                    let mut found = String::new();
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                        for k in ["target", "host", "url", "domain", "ip"] {
+                            if let Some(s) = v.get(k).and_then(|x| x.as_str()) {
+                                found = s.to_string();
+                                break;
+                            }
+                        }
+                    }
+                    if found.is_empty() {
+                        text.split('｜').next().unwrap_or(&text).trim().to_string()
+                    } else {
+                        found
+                    }
+                };
+                if target.is_empty() {
+                    toast(&self.window, "未能从参数中识别出目标，请手动加入授权范围");
+                    return;
+                }
+                let Some(name) = self.base.workspaces.active().map(|w| w.name.clone()) else {
+                    // 全局空间无空间配置，写全局 [scope] authorized
+                    self.cfg.scope.authorized.push(target.clone());
+                    match self.cfg.commit(&self.cfg_path, &[ConfigSection::Scope]) {
+                        Ok(_) => {
+                            self.sync_base_cfg();
+                            self.session = None;
+                            self.ensure_session();
+                            toast(&self.window, format!("目标 {target} 已加入全局授权白名单"));
+                        }
+                        Err(e) => toast(&self.window, format!("加入授权白名单失败：{e}")),
+                    }
+                    return;
+                };
+                let Some(mut w) = self.base.workspaces.get(&name) else { return };
+                if !w.scope.contains(&target) {
+                    w.scope.push(target.clone());
+                }
+                match self.base.workspaces.update(w) {
+                    Ok(()) => {
+                        self.sync_base_cfg();
+                        self.session = None;
+                        self.ensure_session();
+                        apply_snapshot(&self.base, &self.window);
+                        toast(&self.window, format!("目标 {target} 已加入空间「{name}」授权白名单"));
+                    }
+                    Err(e) => toast(&self.window, format!("加入空间白名单失败：{e}")),
                 }
             }
             Cmd::SwitchDomain(id) => {
@@ -1408,6 +1576,7 @@ impl Engine {
                 self.cfg.scope.authorized = rules.clone();
                 match self.cfg.commit(&self.cfg_path, &[ConfigSection::Scope]) {
                     Ok(_) => {
+                        self.sync_base_cfg();
                         let msg = if notes.is_empty() {
                             format!(
                                 "授权范围已保存（{} 条）；新会话生效，当前会话仍用旧范围",
@@ -1447,7 +1616,7 @@ impl Engine {
                     None
                 };
                 if group_op.is_some() {
-                    let path = wpa_engine::registry::registry_path(&self.base.cfg.data_root());
+                    let path = wpa_engine::registry::domain_registry_path(&self.cfg.data_root(), &self.cfg.domain.active);
                     let mut reg = self.base.registry.write().unwrap_or_else(|e| e.into_inner());
                     let (scanned, _) = wpa_engine::registry::scan_plugins(&self.base.cfg.plugins_root());
                     reg.merge_scan(&scanned);
@@ -1478,7 +1647,7 @@ impl Engine {
                 }
                 // move:<组id> = 组↔条目绑定（换归属不动开关）
                 if let Some(to_group) = op.strip_prefix("move:") {
-                    let path = wpa_engine::registry::registry_path(&self.base.cfg.data_root());
+                    let path = wpa_engine::registry::domain_registry_path(&self.cfg.data_root(), &self.cfg.domain.active);
                     let mut reg = match self.base.registry.write() {
                         Ok(g) => g,
                         Err(e) => e.into_inner(),
@@ -1502,7 +1671,7 @@ impl Engine {
                     toast(&self.window, msg);
                     return;
                 }
-                let path = wpa_engine::registry::registry_path(&self.base.cfg.data_root());
+                let path = wpa_engine::registry::domain_registry_path(&self.cfg.data_root(), &self.cfg.domain.active);
                 let msg = {
                     let mut reg = match self.base.registry.write() {
                         Ok(g) => g,
@@ -1682,12 +1851,12 @@ impl Engine {
             }
 
             // #9.1 会话管理
-            Cmd::SessionList => {
+            Cmd::SessionList(filter) => {
                 let Some(store) = self.base.sessions.as_ref() else {
                     toast(&self.window, "会话库不可用");
                     return;
                 };
-                let filter = self.session_filter.clone();
+                let filter = filter.clone();
                 let rows: Vec<SessionRow> = store
                     .list_by_workspace(&filter)
                     .into_iter()
@@ -1714,12 +1883,64 @@ impl Engine {
                     app.set_sessions(ModelRc::new(VecModel::from(rows)));
                 });
             }
-            Cmd::SessionOpen(id) | Cmd::SessionRecall(id) => {
+            Cmd::SessionOpen(id) => {
+                // 真正切换会话：读完整记录 → 重建会话 → 恢复协议历史/轮次 → 续写原记录。
+                // 不再像旧版那样把摘要注入当前会话（那会占用当前会话、丢失当前上下文）。
+                let Some(store) = self.base.sessions.clone() else {
+                    toast(&self.window, "会话库不可用");
+                    return;
+                };
+                let Some(rec) = store.get(&id) else {
+                    toast(&self.window, format!("未找到会话 {id}"));
+                    return;
+                };
+                let snap = agent_core::ChatSession::session_snapshot(&rec);
+                let turns = rec.turns;
+                let label = if rec.title.is_empty() { id.clone() } else { rec.title.clone() };
+
+                // 重建引擎会话（走 ensure_session 的统一装配路径，再覆盖状态）
+                self.session = None;
+                self.ensure_session();
+                if let Some(s) = self.session.as_mut() {
+                    s.restore_full(snap, turns);
+                    s.set_persist_id(Some(id.clone()));
+                    s.set_persist_identity(rec.workspace.clone(), rec.profile.clone());
+                }
+
+                // 重建 UI 消息列表：按展示行还原 user/assistant（轨迹/轮次分隔不进气泡）
+                {
+                    let lines = if let Some(st) = &rec.state { &st.messages } else { &rec.messages };
+                    let mut msgs: Vec<ChatMsg> = Vec::new();
+                    for m in lines {
+                        let role = match m.role {
+                            0 => "user",
+                            1 => "assistant",
+                            3 => "system",
+                            _ => continue,
+                        };
+                        msgs.push(ChatMsg { role: role.into(), text: m.text.clone().into() });
+                    }
+                    *self.ui.messages.lock().unwrap() = msgs.clone();
+                    *self.ui.traces.lock().unwrap() = Vec::new();
+                    let w = self.window.clone();
+                    ui_set(&w, move |app| {
+                        app.set_messages(ModelRc::new(VecModel::from(msgs)));
+                        app.set_traces(ModelRc::new(VecModel::from(Vec::<TraceRow>::new())));
+                        app.set_chat_scroll_y(1e7);
+                        app.set_trace_scroll_y(0.0);
+                    });
+                }
+                if let Some(info) = self.info.clone() {
+                    self.apply_info(&info);
+                }
+                toast(&self.window, format!("已打开会话「{label}」（{} 轮），当前对话已切换", turns));
+            }
+            Cmd::SessionRecall(id) => {
+                // 召回：把旧会话摘要注入当前会话（不切换、不占用当前上下文窗口）
                 let Some(store) = self.base.sessions.as_ref() else { return };
                 match store.recall_preview(&id, 8) {
                     Ok(lines) => {
                         let text = lines.join("\n");
-                        // 召回内容注入到对话框：作为一条 system 消息展示，模型下一轮可见
                         push_msg(&self.window, &self.ui.messages, "assistant", format!("【会话 {id} 召回】\n{text}"));
                         toast(&self.window, format!("已召回会话 {id} 的最近 {} 条", lines.len()));
                     }
