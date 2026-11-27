@@ -5,6 +5,7 @@
 //! OpenAI 兼容端点（DeepSeek / 通义 / 豆包 / 智谱 / Kimi / Ollama / vLLM …）一律用 `openai`。
 
 mod anthropic;
+pub mod embed;
 mod gemini;
 mod profiles;
 mod types;

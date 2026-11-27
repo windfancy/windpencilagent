@@ -35,9 +35,25 @@ pub const CAP_GROUPS: &[CapGroup] = &[
     CapGroup { id: "sandbox", label: "沙箱执行", source: "toolkit-core" },
     CapGroup { id: "net", label: "网络", source: "net-core" },
     CapGroup { id: "text", label: "文本", source: "text-core" },
+    CapGroup { id: "kb", label: "知识读写", source: "data-core" },
     CapGroup { id: "space", label: "工作空间", source: "workspace-core" },
     CapGroup { id: "memory", label: "记忆检索", source: "base-store" },
 ];
+
+/// **基础组**：系统自带、与领域无关的能力。
+///
+/// 它们不参与"装配设置"（领域组引用、空间工具白名单），永远是所有领域的
+/// 工具面子集。理由：这些是基座的运行前提——把 `core` 漏掉就没有知识检索，
+/// 把 `memory`/`space` 漏掉记忆与工作区直接失效，而用户无法从界面上理解
+/// "少勾一个 chip 就把系统搞坏了"。所以它们**只由代码决定，不进任何配置**。
+///
+/// `file` / `net` / `text` / `kb` 之外的专业组与插件组才是可配置部分。
+pub const BASE_GROUPS: &[&str] = &["core", "shell", "sandbox", "space", "memory", "kb"];
+
+/// 是否基础组（装配时无条件保留，且不出现在任何勾选界面里）。
+pub fn is_base_group(id: &str) -> bool {
+    BASE_GROUPS.contains(&id)
+}
 
 /// 工具 → 能力组。
 ///
@@ -66,6 +82,17 @@ pub const TOOL_GROUP: &[(&str, &str)] = &[
     ("text.regex", "text"),
     ("text.extract", "text"),
     ("text.transform", "text"),
+    // 知识读写（sqlite / 向量库）：基础组，所有领域默认可用
+    ("kb.sqlite.create", "kb"),
+    ("kb.sqlite.query", "kb"),
+    ("kb.sqlite.insert", "kb"),
+    ("kb.sqlite.update", "kb"),
+    ("kb.sqlite.delete", "kb"),
+    ("kb.vec.create", "kb"),
+    ("kb.vec.query", "kb"),
+    ("kb.vec.insert", "kb"),
+    ("kb.vec.update", "kb"),
+    ("kb.vec.delete", "kb"),
     ("ws.create", "space"),
     ("ws.list", "space"),
     ("ws.switch", "space"),
@@ -157,6 +184,17 @@ pub const BUILTIN_SPECS: &[BuiltinSpec] = &[
     BuiltinSpec { name: "text.regex", label: "正则", group: "text", risk: "low", caps: &[] },
     BuiltinSpec { name: "text.extract", label: "线索抽取", group: "text", risk: "low", caps: &[] },
     BuiltinSpec { name: "text.transform", label: "文本变换", group: "text", risk: "low", caps: &[] },
+    // kb（知识读写：本地 sqlite 与向量库）
+    BuiltinSpec { name: "kb.sqlite.create", label: "建库建表", group: "kb", risk: "medium", caps: &[] },
+    BuiltinSpec { name: "kb.sqlite.query", label: "SQL 查询", group: "kb", risk: "low", caps: &[] },
+    BuiltinSpec { name: "kb.sqlite.insert", label: "插入行", group: "kb", risk: "medium", caps: &[] },
+    BuiltinSpec { name: "kb.sqlite.update", label: "更新行", group: "kb", risk: "medium", caps: &[] },
+    BuiltinSpec { name: "kb.sqlite.delete", label: "删除行", group: "kb", risk: "medium", caps: &[] },
+    BuiltinSpec { name: "kb.vec.create", label: "建向量库", group: "kb", risk: "medium", caps: &[] },
+    BuiltinSpec { name: "kb.vec.query", label: "向量检索", group: "kb", risk: "low", caps: &[] },
+    BuiltinSpec { name: "kb.vec.insert", label: "向量写入", group: "kb", risk: "medium", caps: &[] },
+    BuiltinSpec { name: "kb.vec.update", label: "向量更新", group: "kb", risk: "medium", caps: &[] },
+    BuiltinSpec { name: "kb.vec.delete", label: "向量删除", group: "kb", risk: "medium", caps: &[] },
     // space
     BuiltinSpec { name: "ws.create", label: "新建空间", group: "space", risk: "low", caps: &[] },
     BuiltinSpec { name: "ws.list", label: "列出空间", group: "space", risk: "low", caps: &[] },
@@ -238,6 +276,22 @@ mod tests {
             for c in s.caps {
                 assert!(wpa_api::registry::caps::is_known(c), "{} 声明了未知能力 {c}", s.name);
             }
+        }
+    }
+
+    /// 基础组必须都是合法组，且 `core` 之类绝不能被当成可配置组。
+    #[test]
+    fn base_groups_are_known_and_not_managed() {
+        for g in BASE_GROUPS {
+            assert!(is_known_group(g), "基础组 {g} 不在 CAP_GROUPS 里");
+        }
+        assert!(is_base_group("core"));
+        assert!(is_base_group("kb"));
+        assert!(!is_base_group("file"));
+        assert!(!is_base_group("net"));
+        // 基础组的工具必须真的登记在 TOOL_GROUP，否则"永远可见"只是一句空话
+        for g in BASE_GROUPS {
+            assert!(!builtin_names_in(g).is_empty(), "基础组 {g} 没有任何工具");
         }
     }
 }

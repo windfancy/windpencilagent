@@ -18,6 +18,7 @@ pub mod llm;
 pub mod snapshot;
 pub mod tools;
 pub mod domain;
+pub mod embedder;
 
 pub use base::{
     apply_net_settings, assemble, build_session, Base, SessionInfo, SessionOpts,

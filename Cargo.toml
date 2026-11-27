@@ -14,6 +14,7 @@ members = [
     "crates/shell-core",
     "crates/workspace-core",
     "crates/knowledge-core",
+    "crates/data-core",
     "crates/tree-core",
     "crates/net-core",
     "crates/text-core",

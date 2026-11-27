@@ -1,0 +1,18 @@
+[package]
+name = "data-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "基座数据原语：本地 sqlite 与向量库的读写工具（知识读写组 kb）"
+
+[dependencies]
+kern-core = { path = "../kern-core" }
+toolkit-core = { path = "../toolkit-core" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+# bundled：随二进制编一份 sqlite3，不依赖用户机器上装没装 sqlite
+rusqlite = { version = "0.32", features = ["bundled"] }

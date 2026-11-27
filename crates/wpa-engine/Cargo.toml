@@ -18,6 +18,7 @@ agent-core = { path = "../agent-core" }
 net-core = { path = "../net-core" }
 text-core = { path = "../text-core" }
 knowledge-core = { path = "../knowledge-core" }
+data-core = { path = "../data-core" }
 tree-core = { path = "../tree-core" }
 plugin-host = { path = "../plugin-host" }
 plugin-abi = { path = "../plugin-abi" }
