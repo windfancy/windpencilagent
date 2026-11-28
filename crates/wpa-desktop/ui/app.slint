@@ -958,20 +958,25 @@ component SpacePage {
                 }
             }
 
-            Text {
-                text: "空间 = 独立目录 + 权限模式 + 沙箱开关 + 模型绑定 + 工具白名单 + 记忆。切换空间后新建会话生效。";
-                color: Theme.palette.text_secondary;
-                font-size: 12px;
-                wrap: word-wrap;
-                min-height: 18px;
-            }
-
+            // 整页可滚动：空间列表不再抢占高度，编辑面板/会话面板不会被窗口底边裁切
             ScrollView {
                 vertical-stretch: 1;
                 content-width: self.width;
                 VerticalLayout {
-                    spacing: 8px;
-                    for s in root.spaces : Rectangle {
+                    width: parent.width;
+                    spacing: 12px;
+
+                    Text {
+                        text: "空间 = 独立目录 + 权限模式 + 沙箱开关 + 模型绑定 + 工具白名单 + 记忆。切换空间后新建会话生效。";
+                        color: Theme.palette.text_secondary;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                        min-height: 18px;
+                    }
+
+                    VerticalLayout {
+                        spacing: 8px;
+                        for s in root.spaces : Rectangle {
                         height: 58px;
                         border-radius: 8px;
                         border-width: s.active ? 2px : 1px;
@@ -1045,8 +1050,7 @@ component SpacePage {
                             }
                         }
                     }
-                }
-            }
+                    }
 
             // 空间编辑面板（点"编辑"后出现）
             if root.edit-space != "" : Rectangle {
@@ -1149,7 +1153,8 @@ component SpacePage {
 
             // 会话管理（选中空间后列出该空间的会话）
             if root.edit-space != "" : Rectangle {
-                vertical-stretch: 1;
+                // 外层已可滚动，这里用最小高度而非 stretch（stretch 会被压成 0）
+                min-height: 200px;
                 border-radius: 8px;
                 border-width: 1px;
                 border-color: Theme.palette.border;
@@ -1192,6 +1197,8 @@ component SpacePage {
                             }
                         }
                     }
+                }
+            }
                 }
             }
         }
@@ -2544,7 +2551,9 @@ component DomainPage inherits Rectangle {
                                     padding-left: 10px;
                                     padding-right: 10px;
                                     Text {
-                                        text: (c.declared ? "✓ " : "") + c.label + (c.enabled ? "" : "（全局禁用）");
+                                        // 不用 "✓" 前缀：默认字体缺该字形会渲染成空心方块，
+                                        // 选中状态已由蓝色底 + 白字表达。
+                                        text: c.label + (c.enabled ? "" : "（全局禁用）");
                                         color: !c.enabled
                                             ? Theme.palette.text_disabled
                                             : (c.declared ? Theme.palette.on_primary : Theme.palette.text_secondary);
@@ -2877,9 +2886,13 @@ component AbilityPage inherits Rectangle {
                     height: 20px;
                     vertical-alignment: center;
                 }
-                VerticalLayout {
+                // 组多时必须能滚动：原来是无滚动的 VerticalLayout，溢出后把
+                // 下面的「组管理」卡片（新建/改名/删组）挤出可视区，导致删不掉空组。
+                ScrollView {
                     vertical-stretch: 1;
-                    width: parent.width;
+                    content-width: self.width;
+                    VerticalLayout {
+                        width: parent.width;
                         spacing: 2px;
                         for g in groups : TouchArea {
                             height: 56px;
@@ -2936,6 +2949,7 @@ component AbilityPage inherits Rectangle {
                             }
                         }
                     }
+                }
                 // 组管理（#5）：新建 / 改名 / 删除 / 描述
                 Rectangle {
                     height: 116px;
@@ -2985,9 +2999,12 @@ component AbilityPage inherits Rectangle {
                     height: 22px;
                     vertical-alignment: center;
                 }
-                VerticalLayout {
+                // 条目多时可滚动（与组列表同理）
+                ScrollView {
                     vertical-stretch: 1;
-                    width: parent.width;
+                    content-width: self.width;
+                    VerticalLayout {
+                        width: parent.width;
                         spacing: 0px;
                         for e in entries : TouchArea {
                             // visible 防溢出绘制；零高度避免 visible:false 仍占 44px 导致当前组无法顶部对齐
@@ -3038,6 +3055,7 @@ component AbilityPage inherits Rectangle {
                             }
                         }
                     }
+                }
             }
         }
 

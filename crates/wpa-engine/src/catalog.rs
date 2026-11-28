@@ -105,8 +105,14 @@ pub const TOOL_GROUP: &[(&str, &str)] = &[
 ];
 
 /// 智能体层工具（不属于任何能力组，不随领域收敛）。
-pub const AGENT_TOOLS: &[&str] =
-    &["plan.create", "plan.update", "plan.view", "plan.exit", "subagent.spawn"];
+pub const AGENT_TOOLS: &[&str] = &[
+    "plan.create",
+    "plan.update",
+    "plan.view",
+    "plan.exit",
+    "subagent.spawn",
+    "task.todo",
+];
 
 /// 查询工具所属能力组（未知 ⇒ `None`，调用方应按"保留"处理）。
 pub fn group_of(tool: &str) -> Option<&'static str> {

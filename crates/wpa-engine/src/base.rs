@@ -215,6 +215,9 @@ pub async fn assemble(cfg: &AppConfig, _cli_tree: Option<PathBuf>) -> anyhow::Re
     // 不注入的话所有命令都判 High，再撞上知识约束的 min_risk=high 规则——
     // 结果就是"授权了仍被拦"（用户实测的核心问题）。
     toolkit_core::risk_policy::install_rules(toolkit_core::risk_policy::builtin_rules());
+    // AppContainer 隔离开关（此前是配置页里的死开关）：false 时不套容器，
+    // 避免容器创建失败导致整条受限执行链不可用。
+    toolkit_core::sandbox::set_app_container(cfg.sandbox.app_container);
     let workspaces = Arc::new(
         WorkspaceRegistry::open(cfg.workspaces_root())
             .map_err(|e| anyhow::anyhow!("打开空间注册表失败：{e}"))?,
@@ -278,17 +281,24 @@ pub async fn assemble(cfg: &AppConfig, _cli_tree: Option<PathBuf>) -> anyhow::Re
     // 协作层（subagent.spawn）：provider 用可替换槽，换模型后子代理跟着换
     let provider_cell: agent_core::subagent::ProviderCell =
         Arc::new(std::sync::RwLock::new(None));
+    // 子代理高风险开关句柄：注册时创建，领域加载后写值（None = 未启用子代理）
+    let mut subagent_high_risk_flag: Option<Arc<std::sync::atomic::AtomicBool>> = None;
     if cfg.agent.subagent_enabled {
+        // 高风险管理开关：先按 true 占位，领域包加载后写入真实值（见下方 [params]）。
+        let high_risk_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let sub = agent_core::SubagentTool::new(
             provider_cell.clone(),
             kern.clone(),
             executor.clone(),
             cfg.scope.authorized.clone(),
             cfg.agent.subagent_max_rounds,
-        );
+        )
+        .with_high_risk_flag(high_risk_flag.clone());
         if let Err(e) = kern.register_tool(Arc::new(sub)) {
             warnings.push(format!("注册 subagent.spawn 失败：{e}"));
         }
+        // 存起来，等 domain 加载完再落值
+        subagent_high_risk_flag = Some(high_risk_flag);
     }
 
     // 存储（L3 经验库 / 任务库）
@@ -297,6 +307,11 @@ pub async fn assemble(cfg: &AppConfig, _cli_tree: Option<PathBuf>) -> anyhow::Re
         base_store::TaskStore::open(data_root.join("tasks"))
             .map_err(|e| anyhow::anyhow!("打开任务库失败：{e}"))?,
     );
+    // 智能体层：任务清单工具（模型整表维护，看板同步显示）。
+    // 直接注册到内核（与 plan.* / subagent.spawn 同层，不经过注册表账本）。
+    if let Err(e) = kern.register_tool(Arc::new(crate::task_tool::TaskTodoTool(tasks.clone()))) {
+        warnings.push(format!("注册 task.todo 失败：{e}"));
+    }
     let experience = Arc::new(
         base_store::ExperienceStore::open(data_root.join("experience"))
             .map_err(|e| anyhow::anyhow!("打开经验库失败：{e}"))?,
@@ -475,6 +490,19 @@ pub async fn assemble(cfg: &AppConfig, _cli_tree: Option<PathBuf>) -> anyhow::Re
             }
             domain_pack = Some(Arc::new(p));
         }
+    }
+
+    // 领域 `[params] allow_high_risk` 落值：同时约束主会话工具面与子代理。
+    // 非领域模式（纯基座）默认允许，保持既有行为。
+    let allow_high_risk = domain_pack
+        .as_ref()
+        .map(|d| d.params.allow_high_risk)
+        .unwrap_or(true);
+    if let Some(flag) = &subagent_high_risk_flag {
+        flag.store(
+            allow_high_risk,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     // 知识约束：从所有 provider 收集并编译为可执行 guard
@@ -812,6 +840,35 @@ pub fn build_session(base: &Base, opts: SessionOpts) -> (ChatSession, SessionInf
     }
     // 不支持工具调用时整体清空：保留 schema 只会让 prompt 里出现"可用工具"却调不通
     let schemas: Vec<ToolSchema> = if tools_enabled { schemas } else { Vec::new() };
+
+    // 领域 `allow_high_risk=false` ⇒ High/Critical 不进工具面（该参数此前从未被消费）。
+    let allow_high_risk = base
+        .domain
+        .as_ref()
+        .map(|d| d.params.allow_high_risk)
+        .unwrap_or(true);
+    let schemas: Vec<ToolSchema> = if allow_high_risk {
+        schemas
+    } else {
+        let before = schemas.len();
+        let kept: Vec<ToolSchema> = schemas
+            .into_iter()
+            .filter(|s| {
+                !matches!(
+                    risks.get(&s.name),
+                    Some(kern_core::model::RiskLevel::High)
+                        | Some(kern_core::model::RiskLevel::Critical)
+                )
+            })
+            .collect();
+        if kept.len() != before {
+            warnings.push(format!(
+                "领域 allow_high_risk=false：已从工具面剔除 {} 个高风险工具",
+                before - kept.len()
+            ));
+        }
+        kept
+    };
 
     // 6) 技能：树提供的技能包（空间可用技能名过滤 + 依赖闸 + 关键词预筛素材）
     //

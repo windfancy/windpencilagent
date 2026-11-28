@@ -16,6 +16,7 @@ pub mod host;
 pub mod plugin_rt;
 pub mod llm;
 pub mod snapshot;
+pub mod task_tool;
 pub mod tools;
 pub mod domain;
 pub mod embedder;

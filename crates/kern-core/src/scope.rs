@@ -104,10 +104,17 @@ impl ScopeRule {
         match self {
             // 完全访问：任何目标都算在授权范围内。
             Self::Any => true,
-            Self::CidrV4 { net, prefix } => target
-                .parse::<Ipv4Addr>()
-                .map(|ip| cidr_v4_contains(*net, *prefix, ip))
-                .unwrap_or(false),
+            // CIDR 授权：目标既可以是单个 IP，也可以是一个 CIDR（子网 ⊆ 授权网段）。
+            Self::CidrV4 { net, prefix } => {
+                if let Some((tnet, tprefix)) = split_v4_cidr(target) {
+                    // 目标网段必须被授权网段完整覆盖：前缀更长（更窄）且网络位对齐。
+                    return tprefix >= *prefix && cidr_v4_contains(*net, *prefix, tnet);
+                }
+                target
+                    .parse::<Ipv4Addr>()
+                    .map(|ip| cidr_v4_contains(*net, *prefix, ip))
+                    .unwrap_or(false)
+            }
             Self::CidrV6 { net, prefix } => target
                 .parse::<Ipv6Addr>()
                 .map(|ip| cidr_v6_contains(*net, *prefix, ip))
@@ -138,8 +145,18 @@ fn is_single_label(raw: &str) -> bool {
     raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-fn cidr_v4_contains(net: Ipv4Addr, prefix: u8, ip: Ipv4Addr) -> bool {
-    let a = u32::from(net);
+/// 把 `a.b.c.d/p` 解析成 (网络地址, 前缀)；非 CIDR 返回 None。
+fn split_v4_cidr(target: &str) -> Option<(Ipv4Addr, u8)> {
+    let (ip, prefix) = target.trim().split_once('/')?;
+    let net = ip.trim().parse::<Ipv4Addr>().ok()?;
+    let prefix = prefix.trim().parse::<u8>().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    Some((net, prefix))
+}
+
+fn cidr_v4_contains(net: Ipv4Addr, prefix: u8, ip: Ipv4Addr) -> bool {    let a = u32::from(net);
     let b = u32::from(ip);
     if prefix == 0 {
         return true;
@@ -325,6 +342,19 @@ mod tests {
         assert!(g.check_target("10.26.1.42").is_err());
         assert!(g.check_target("192.168.1.5").is_ok());
         assert!(g.check_target("192.168.1.6").is_err());
+    }
+
+    #[test]
+    fn cidr_target_must_be_covered_by_allowed_cidr() {
+        // 目标本身是网段时：必须被授权网段完整覆盖才算通过
+        let g = ScopeGuard::from_lists(&["192.168.0.0/16".into()], &[]).unwrap();
+        assert!(g.check_target("192.168.1.0/24").is_ok(), "子网应通过");
+        assert!(g.check_target("192.168.1.16/32").is_ok(), "/32 应通过");
+        assert!(g.check_target("10.0.0.0/24").is_err(), "不在授权网段应拒绝");
+
+        // 目标比授权更宽（/16 覆盖 /24）→ 不能借它绕过范围
+        let g2 = ScopeGuard::from_lists(&["192.168.1.0/24".into()], &[]).unwrap();
+        assert!(g2.check_target("192.168.0.0/16").is_err());
     }
 
     #[test]

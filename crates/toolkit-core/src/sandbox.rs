@@ -43,6 +43,18 @@ pub fn effective_restricted(global_default: bool) -> bool {
     space_sandbox().unwrap_or(global_default)
 }
 
+/// AppContainer 隔离开关（全局配置 `[sandbox] app_container`）。
+/// false 时不套 AppContainer，退化为"仅限时 + 配额 + 环境洗涤"的普通执行。
+static APP_CONTAINER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_app_container(on: bool) {
+    APP_CONTAINER.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn app_container_enabled() -> bool {
+    APP_CONTAINER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// R4-5（dsh X6 凭据洗涤）：环境变量名是否疑似凭据（KEY/PASSWORD/SECRET/TOKEN/
 /// CREDENTIAL 形命名，大小写不敏感）。
 pub fn is_credential_var(name: &str) -> bool {
@@ -145,7 +157,9 @@ impl Sandbox {
         // R5-6：受限令牌模式（opt-in）——Safer NORMALUSER 令牌 + CreateProcessAsUserW。
         // fail-closed：令牌创建任一步失败即拒绝执行；超时在 FFI 内 WaitForSingleObject
         // 超时 + TerminateProcess 自处理，无需外层取消。
-        if self.cfg.restricted {
+        // `[sandbox] app_container=false` 时不套 AppContainer（避免容器创建失败导致
+        // 整条执行链不可用），退化为仅限时 + 配额 + 环境洗涤的普通执行。
+        if self.cfg.restricted && app_container_enabled() {
             let cwd = std::env::current_dir()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();

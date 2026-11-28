@@ -26,6 +26,9 @@ pub struct SubagentTool {
     executor: Arc<dyn ToolExecutor>,
     authorized_scope: Vec<String>,
     max_rounds: usize,
+    /// 领域参数 `allow_high_risk`：true 时 High/Critical 也可进子代理工具面并自动放行。
+    /// 装配时先按 true 注册，领域加载完成后由 `base.rs` 写入真实值。
+    allow_high_risk: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SubagentTool {
@@ -42,11 +45,21 @@ impl SubagentTool {
             executor,
             authorized_scope,
             max_rounds: max_rounds.clamp(2, 8),
+            allow_high_risk: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
+    }
+
+    /// 共享同一开关：装配层在领域加载后写入，工具运行时读取。
+    pub fn with_high_risk_flag(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.allow_high_risk = flag;
+        self
     }
 
     /// 动态收集受限工具面：排除 spawn 自身（防递归）与高危（High/Critical）。
     fn restricted_toolset(&self) -> (Vec<ToolSchema>, HashMap<String, RiskLevel>) {
+        let allow_high = self
+            .allow_high_risk
+            .load(std::sync::atomic::Ordering::Relaxed);
         let mut schemas = Vec::new();
         let mut risks = HashMap::new();
         for name in self.registry.tools() {
@@ -55,7 +68,9 @@ impl SubagentTool {
             }
             if let Some(t) = self.registry.tool(&name) {
                 let risk = t.risk();
-                if matches!(risk, RiskLevel::None | RiskLevel::Low | RiskLevel::Medium) {
+                let ok = matches!(risk, RiskLevel::None | RiskLevel::Low | RiskLevel::Medium)
+                    || (allow_high && matches!(risk, RiskLevel::High | RiskLevel::Critical));
+                if ok {
                     schemas.push(ToolSchema {
                         name: t.name().to_string(),
                         description: t.description(),
@@ -113,11 +128,15 @@ impl Tool for SubagentTool {
             .unwrap_or(self.max_rounds as u64)
             .clamp(2, 8) as usize;
 
-        // 子代理：高危审批一律拒绝（fail-closed 受限执行）
+        // 子代理：高危审批一律拒绝（fail-closed 受限执行）；
+        // 领域显式 allow_high_risk=true（如渗透领域）时放行，否则模型看得到也执行不了。
         let Some(provider) = self.provider.read().ok().and_then(|g| g.clone()) else {
             return ToolResult::error("子代理不可用：当前会话没有可用模型", ms());
         };
-        let deny_high_risk: ApprovalCallback = Arc::new(|_tool, _risk, _summary| false);
+        let allow_hr = self
+            .allow_high_risk
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let deny_high_risk: ApprovalCallback = Arc::new(move |_tool, _risk, _summary| allow_hr);
         let (schemas, risks) = self.restricted_toolset();
         let cfg = ChatConfig {
             authorized_scope: self.authorized_scope.clone(),

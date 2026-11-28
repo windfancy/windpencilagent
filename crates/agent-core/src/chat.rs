@@ -283,6 +283,10 @@ pub struct ChatSession {
     plan: Option<crate::plan_state::SharedPlan>,
     /// 本轮工具失败次数（反思层的触发依据；每轮开始时清零）
     turn_failed: usize,
+    /// 会话级授权守卫：承载动作黑名单与探测限速策略（与 scope_denial 同源规则）
+    guard: kern_core::ScopeGuard,
+    /// 上次主动探测类工具调用时间（限速用）
+    last_probe: Option<std::time::Instant>,
 }
 
 impl ChatSession {
@@ -295,6 +299,8 @@ impl ChatSession {
         cfg: ChatConfig,
         approval: ApprovalCallback,
     ) -> Self {
+        // 会话级守卫：与 scope_denial 同一套规则解析，承载动作黑名单与限速策略。
+        let guard = kern_core::ScopeGuard::from_lists_lenient(&cfg.authorized_scope, &cfg.denylist).0;
         Self {
             provider,
             executor,
@@ -328,6 +334,8 @@ impl ChatSession {
             repeat_count: 0,
             plan: None,
             turn_failed: 0,
+            guard,
+            last_probe: None,
         }
     }
 
@@ -1189,6 +1197,32 @@ impl ChatSession {
                 "error": "目标命中拒绝清单（授权范围中排除的目标），禁止对该目标调用任何工具"
             }).to_string());
         }
+        // 高危动作黑名单（此前 `action_blocked` 全仓无调用者 = 死代码）：命中即硬拒绝。
+        if self.guard.action_blocked(tool) {
+            trace.push(format!("[FAIL] {tool}（命中高危动作黑名单）"));
+            self.emit(ChatEvent::ToolFinished {
+                tool: tool.to_string(),
+                ok: false,
+                summary: "命中高危动作黑名单，已拒绝执行".into(),
+                duration_ms: 0,
+                detail: String::new(),
+            });
+            return Prepared::Denied(json!({
+                "ok": false,
+                "error": format!("工具 {tool} 命中高危动作黑名单（exploit.persist / exploit.pivot / system.destroy），禁止执行")
+            }).to_string());
+        }
+        // 主动探测限速（此前 `enforce_rate_limit` 无人消费）：net./scan. 类工具最小间隔 200ms。
+        if self.guard.rate_limit_enforced() && is_probe_tool(tool) {
+            const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+            if let Some(last) = self.last_probe {
+                let elapsed = last.elapsed();
+                if elapsed < MIN_INTERVAL {
+                    tokio::time::sleep(MIN_INTERVAL - elapsed).await;
+                }
+            }
+            self.last_probe = Some(std::time::Instant::now());
+        }
         // 授权范围校验（ScopeGuard）：带目标的调用不在白名单内时，不再硬拒绝 +
         // "让用户自己去配置里开"，而是发审批请求让用户当场授权（本次/本轮/空间白名单）。
         // 注意：denylist 命中在前面已硬拒绝，这里只处理"未显式授权"这类可当场批准的情况。
@@ -1723,7 +1757,7 @@ impl ChatSession {
 之后逐步执行，计划可随观察动态调整。\n\
 3. 动作选择遵循三级决策树：\n\
    ① 优先使用已注册工具；\n\
-   ② 无合适工具时，用 os.exec 或 shell.run 执行系统自带命令；\n\
+   ② 确实没有对应工具时才使用系统命令（os.exec / shell.run），且不得借外部程序替代已注册能力；\n\
    ③ 仍不足时，用 file.write 写脚本，必要时先安装依赖，再用 sandbox.python 执行。\n\
 4. 工具失败先判断是否重试（同参数最多重试 2 次）；重试仍失败则记录原因，换工具或推进其他子任务；\
 系统提示连续失败 3 次时必须调整方向或终止。\n\
@@ -1981,7 +2015,11 @@ pub fn estimate_text_tokens(text: &str) -> usize {
 ///
 /// **故意不含 `name`**：`name` 在 ws.create / skill 类工具里是"名字"不是"目标"，
 /// 拿它做范围校验会把"创建空间"误判成越权。
-const TARGET_KEYS: &[&str] = &["target", "host", "url", "domain", "endpoint", "ip", "targets"];
+const TARGET_KEYS: &[&str] = &[
+    "target", "host", "url", "domain", "endpoint", "ip", "targets",
+    // 子网类参数同样可能承载目标；漏掉这些键等于跳过范围校验（安全洞）。
+    "cidr", "subnet", "ip_range", "network", "range", "hosts", "hostname",
+];
 
 /// 把 URL / host:port 归一成"主机名或 IP"，供 ScopeRule 匹配。
 pub fn normalize_target(raw: &str) -> String {
@@ -2023,6 +2061,11 @@ pub fn targets_in_args(args: &Value) -> Vec<String> {
         }
     }
     out
+}
+
+/// 主动探测类工具（网络扫描 / 可达性 / 端口探测）：受最小调用间隔限速约束。
+fn is_probe_tool(tool: &str) -> bool {
+    tool.starts_with("net.") || tool.starts_with("scan.")
 }
 
 /// 授权范围硬校验：带目标的调用必须落在白名单内（黑名单优先）。
@@ -3277,6 +3320,16 @@ mod tests {
         let r = scope_denial(&mixed, &["10.0.0.0/XX".into()], &json!({"host": "10.0.0.5"}))
             .expect("应拒绝");
         assert!(r.contains("未通过授权校验"), "{r}");
+    }
+
+    #[test]
+    fn cidr_target_keys_are_scope_checked() {
+        // 目标放在 cidr/subnet 等键里也必须被校验，不能因键名不认识而跳过
+        let scope: Vec<String> = vec!["192.168.0.0/16".into()];
+        assert!(scope_denial(&scope, &[], &json!({"cidr": "192.168.1.0/24"})).is_none());
+        assert!(scope_denial(&scope, &[], &json!({"subnet": "10.0.0.0/24"})).is_some());
+        assert!(scope_denial(&scope, &[], &json!({"ip_range": "192.168.3.0/24"})).is_none());
+        assert!(scope_denial(&scope, &[], &json!({"network": "172.16.0.0/24"})).is_some());
     }
 
     #[test]

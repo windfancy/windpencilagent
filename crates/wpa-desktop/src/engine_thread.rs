@@ -2100,7 +2100,8 @@ impl Engine {
                 if title.is_empty() {
                     return;
                 }
-                match self.base.tasks.create(&title, "", "", "", vec![]) {
+                // owner=agent：与模型维护的清单共用同一张表，能被 task.todo 回注/整表覆盖
+                match self.base.tasks.create(&title, "", "", "agent", vec![]) {
                     Ok(id) => {
                         toast(&self.window, format!("已添加任务 #{id}"));
                         apply_snapshot(&self.base, &self.window);
