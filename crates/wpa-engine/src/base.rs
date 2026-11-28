@@ -118,12 +118,32 @@ fn register_base_tools(
     embedder: Arc<crate::embedder::SharedEmbedder>,
 ) -> anyhow::Result<()> {
     let restricted = cfg.sandbox.restricted_token;
+    // 工作区根：优先用当前空间 cwd（必须真实存在），否则回落 exe 同级目录。
+    // 这是「模型脚本/报告默认保存在当前空间」的落点基础。
+    let active_ws = workspaces.active();
+    let ws_root: Option<std::path::PathBuf> = active_ws
+        .as_ref()
+        .map(|w| w.cwd.trim())
+        .filter(|c| !c.is_empty())
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_dir());
+    let write_outside = active_ws.as_ref().map(|w| w.unrestricted).unwrap_or(false);
     let mut r = Reg::new(kern, reg);
     r.add("util.echo", Arc::new(Echo))?;
-    r.add("file.read", Arc::new(FileReadTool::new()))?;
-    r.add("file.write", Arc::new(FileWriteTool::new()))?;
+    r.add("file.read", Arc::new(match &ws_root {
+        Some(root) => FileReadTool::with_root(root.clone()),
+        None => FileReadTool::new(),
+    }))?;
+    r.add("file.write", Arc::new(match &ws_root {
+        Some(root) => FileWriteTool::with_root(root.clone()).with_allow_outside(write_outside),
+        None => FileWriteTool::new().with_allow_outside(write_outside),
+    }))?;
     r.add("os.exec", Arc::new(ProcExec::new().with_restricted(restricted)))?;
-    r.add("sandbox.python", Arc::new(PySandboxTool::default().with_restricted(restricted)))?;
+    r.add("sandbox.python", Arc::new(
+        PySandboxTool::default()
+            .with_restricted(restricted)
+            .with_workspace_root(ws_root.clone()),
+    ))?;
     r.add("sandbox.pip", Arc::new(PipTool))?;
 
     // shell 会话（持久 cwd / env）
@@ -334,7 +354,15 @@ pub async fn assemble(cfg: &AppConfig, _cli_tree: Option<PathBuf>) -> anyhow::Re
     }
 
     let session_id = SessionId::new();
-    let runtime = Arc::new(BaseRuntime::new(session_id.to_string(), Some(data_root.clone())));
+    // 会话边界：把空间 cwd 注入运行时，树包插槽 workspace.cwd 与 file/shell 落点一致。
+    let ws_cwd = workspaces.active().and_then(|w| {
+        let c = w.cwd.trim().to_string();
+        (!c.is_empty()).then(|| std::path::PathBuf::from(c))
+    });
+    let runtime = Arc::new(
+        BaseRuntime::new(session_id.to_string(), Some(data_root.clone()))
+            .with_workspace_cwd(ws_cwd),
+    );
 
     let mut api = GroupRegistry::new();
     let phases: Vec<wpa_api::Phase> = Vec::new();
@@ -493,11 +521,16 @@ pub async fn assemble(cfg: &AppConfig, _cli_tree: Option<PathBuf>) -> anyhow::Re
     }
 
     // 领域 `[params] allow_high_risk` 落值：同时约束主会话工具面与子代理。
+    // 空间显式设置优先（用户要求：高风险开关必须在空间里可见可配）。
     // 非领域模式（纯基座）默认允许，保持既有行为。
-    let allow_high_risk = domain_pack
+    let domain_allow = domain_pack
         .as_ref()
         .map(|d| d.params.allow_high_risk)
         .unwrap_or(true);
+    let allow_high_risk = workspaces
+        .active()
+        .map(|w| w.high_risk_allowed(domain_allow))
+        .unwrap_or(domain_allow);
     if let Some(flag) = &subagent_high_risk_flag {
         flag.store(
             allow_high_risk,
@@ -842,11 +875,17 @@ pub fn build_session(base: &Base, opts: SessionOpts) -> (ChatSession, SessionInf
     let schemas: Vec<ToolSchema> = if tools_enabled { schemas } else { Vec::new() };
 
     // 领域 `allow_high_risk=false` ⇒ High/Critical 不进工具面（该参数此前从未被消费）。
-    let allow_high_risk = base
+    // 空间设置优先：Some(true) 即使领域禁止也放行；Some(false) 即使领域允许也剔除。
+    let domain_allow = base
         .domain
         .as_ref()
         .map(|d| d.params.allow_high_risk)
         .unwrap_or(true);
+    let allow_high_risk = base
+        .workspaces
+        .active()
+        .map(|w| w.high_risk_allowed(domain_allow))
+        .unwrap_or(domain_allow);
     let schemas: Vec<ToolSchema> = if allow_high_risk {
         schemas
     } else {
@@ -1173,17 +1212,26 @@ impl Base {
             .workspaces
             .list()
             .into_iter()
-            .map(|w| SpaceRow {
-                active: w.name == active,
-                cwd: w.cwd.clone(),
-                trees: w.trees.clone(),
-                whitelist: w.plugins.clone(),
-                permission: w.permission_label().to_string(),
-                sandbox: w.sandbox_label(global_sandbox).to_string(),
-                plugins: w.plugins.len(),
-                skills: w.skills.len(),
-                note: w.note.clone(),
-                name: w.name,
+            .map(|w| {
+                // 工作区文件列表：让"空间映射的本地目录"在界面上真正可见。
+                let root = self.workspaces.workspace_root_of(&w.name);
+                let (files, file_total) = crate::snapshot::list_workspace_files(&root, 100);
+                SpaceRow {
+                    active: w.name == active,
+                    cwd: w.cwd.clone(),
+                    root: root.display().to_string(),
+                    files,
+                    file_total,
+                    trees: w.trees.clone(),
+                    whitelist: w.plugins.clone(),
+                    permission: w.permission_label().to_string(),
+                    sandbox: w.sandbox_label(global_sandbox).to_string(),
+                    high_risk: w.high_risk_label().to_string(),
+                    plugins: w.plugins.len(),
+                    skills: w.skills.len(),
+                    note: w.note.clone(),
+                    name: w.name,
+                }
             })
             .collect();
 

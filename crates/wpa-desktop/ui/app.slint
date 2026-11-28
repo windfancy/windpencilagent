@@ -95,6 +95,14 @@ export struct RegEntryRow {
     note: string,
 }
 
+export struct FileRow {
+    name: string,
+    /// 是否目录
+    is-dir: bool,
+    /// 人类可读大小（目录为空）
+    size: string,
+}
+
 export struct SpaceRow {
     name: string,
     active: bool,
@@ -102,12 +110,20 @@ export struct SpaceRow {
     note: string,
     /// 绑定的本地目录（shell/文件工具落点）
     cwd: string,
+    /// 工作区根（cwd 为空时回落空间数据目录）
+    root: string,
+    /// 工作区顶层条目（最多 100，目录在前）
+    files: [FileRow],
+    /// 顶层条目总数
+    file-total: int,
     /// 工具白名单（Rust 侧用换行拼好）
     whitelist: string,
     /// 权限模式："global"（默认继承全局）/ "unrestricted"（允许完全访问）
     permission: string,
     /// 沙箱："on" / "off"
     sandbox: string,
+    /// 高风险工具："domain"（跟随领域）/ "on" / "off"
+    high-risk: string,
 }
 
 export struct ModelRow {
@@ -873,6 +889,68 @@ component Seg2 inherits Rectangle {
     }
 }
 
+/// 三档分段选择（高风险：跟随领域 / 允许 / 禁止）
+component Seg3 inherits Rectangle {
+    in property <string> a-label;
+    in property <string> b-label;
+    in property <string> c-label;
+    in property <int> selected-index: 0;
+    callback picked(int);
+
+    height: 26px;
+    border-radius: 6px;
+    background: Theme.palette.surface;
+    border-width: 1px;
+    border-color: Theme.palette.border;
+
+    HorizontalLayout {
+        padding: 2px;
+        spacing: 2px;
+        Rectangle {
+            horizontal-stretch: 1;
+            height: 100%;
+            border-radius: 4px;
+            background: root.selected-index == 0 ? Theme.palette.primary : transparent;
+            Text {
+                text: root.a-label;
+                color: root.selected-index == 0 ? Theme.palette.on_primary : Theme.palette.text_secondary;
+                font-size: 11px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            TouchArea { clicked => { root.picked(0); } }
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+            height: 100%;
+            border-radius: 4px;
+            background: root.selected-index == 1 ? Theme.palette.primary : transparent;
+            Text {
+                text: root.b-label;
+                color: root.selected-index == 1 ? Theme.palette.on_primary : Theme.palette.text_secondary;
+                font-size: 11px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            TouchArea { clicked => { root.picked(1); } }
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+            height: 100%;
+            border-radius: 4px;
+            background: root.selected-index == 2 ? Theme.palette.primary : transparent;
+            Text {
+                text: root.c-label;
+                color: root.selected-index == 2 ? Theme.palette.on_primary : Theme.palette.text_secondary;
+                font-size: 11px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            TouchArea { clicked => { root.picked(2); } }
+        }
+    }
+}
+
 component SpacePage {
     in property <[SpaceRow]> spaces;
     in property <[CapGroupRow]> groups;
@@ -886,6 +964,7 @@ component SpacePage {
     in-out property <string> edit-whitelist;
     in-out property <string> edit-permission;
     in-out property <string> edit-sandbox;
+    in-out property <string> edit-high-risk;
     in-out property <string> session-filter;
 
     callback switch-to(string);
@@ -894,6 +973,8 @@ component SpacePage {
     callback space-save(string);
     callback space-pick(string);
     callback space-toggle-group(string);
+    callback open-workspace-dir(string);
+    callback init-workspace-dir(string);
     callback pick-dir(string);
     callback session-list(string);
     callback session-open(string);
@@ -1024,6 +1105,7 @@ component SpacePage {
                                     root.edit-whitelist = s.whitelist;
                                     root.edit-permission = s.permission;
                                     root.edit-sandbox = s.sandbox;
+                                    root.edit-high-risk = s.high-risk;
                                     root.space-pick(s.name);
                                     root.session-filter = s.name;
                                     root.session-list(s.name);
@@ -1074,7 +1156,7 @@ component SpacePage {
                         wrap: word-wrap;
                     }
                     Text {
-                        text: "目录 = shell/文件工具的工作落点；权限与沙箱在此单独设定，保存后新建会话生效。";
+                        text: "目录 = 工作区根：脚本落 scripts/，报告与产物落 output/，相对路径都以此为准。保存或切换空间后重新装配生效。";
                         color: Theme.palette.text_disabled;
                         font-size: 11px;
                         wrap: word-wrap;
@@ -1123,6 +1205,52 @@ component SpacePage {
                         TextEdit { text <=> root.edit-whitelist; height: 40px; wrap: word-wrap; }
                     }
 
+                    // 工作区：路径 + 顶层文件（让「空间映射的本地目录」可见、可打开、可初始化）
+                    for s in root.spaces : Rectangle {
+                        height: s.name == root.edit-space
+                            ? (s.files.length == 0
+                                ? 88px
+                                : 54px + Math.min(s.files.length, 8) * 20px + (s.file-total > 8 ? 14px : 0px))
+                            : 0px;
+                        clip: true;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: Theme.palette.border;
+                        background: Theme.palette.surface;
+                        VerticalLayout {
+                            padding: 8px;
+                            spacing: 4px;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Text { text: "工作区"; width: 44px; color: Theme.palette.text_primary; font-size: 11px; font-weight: 600; vertical-alignment: center; }
+                                Text { text: s.root; horizontal-stretch: 1; color: Theme.palette.text_disabled; font-size: 10px; overflow: elide; vertical-alignment: center; }
+                                Button { text: "打开"; width: 52px; height: 22px; outlined: true; clicked => { root.open-workspace-dir(s.name); } }
+                                Button { text: "初始化"; width: 62px; height: 22px; outlined: true; clicked => { root.init-workspace-dir(s.name); } }
+                            }
+                            if s.files.length == 0 : Text {
+                                text: "工作区为空：点「初始化」生成 scripts/（脚本）、output/（报告）与 AGENTS.md";
+                                color: Theme.palette.text_disabled;
+                                font-size: 10px;
+                                wrap: word-wrap;
+                            }
+                            for f[i] in s.files : Rectangle {
+                                visible: i < 8;
+                                height: i < 8 ? 20px : 0px;
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    Text { text: f.is-dir ? "目录" : ""; width: 26px; color: Theme.palette.primary; font-size: 10px; vertical-alignment: center; }
+                                    Text { text: f.name; horizontal-stretch: 1; color: Theme.palette.text_primary; font-size: 10px; overflow: elide; vertical-alignment: center; }
+                                    Text { text: f.size; width: 56px; horizontal-alignment: right; color: Theme.palette.text_disabled; font-size: 10px; vertical-alignment: center; }
+                                }
+                            }
+                            if s.file-total > 8 : Text {
+                                text: "共 " + s.file-total + " 项，仅显示前 8 项";
+                                color: Theme.palette.text_disabled;
+                                font-size: 10px;
+                            }
+                        }
+                    }
+
                     // 权限 / 沙箱：两档分段选择（不再用会显示 Search... 的下拉框）
                     HorizontalLayout {
                         spacing: 8px;
@@ -1141,6 +1269,15 @@ component SpacePage {
                             b-selected: root.edit-sandbox == "on";
                             picked(b) => { root.edit-sandbox = b ? "on" : "off"; }
                             width: 132px;
+                        }
+                        Text { text: "高风险"; width: 44px; color: Theme.palette.text_secondary; font-size: 11px; vertical-alignment: center; }
+                        Seg3 {
+                            a-label: "跟随领域";
+                            b-label: "允许";
+                            c-label: "禁止";
+                            selected-index: root.edit-high-risk == "on" ? 1 : (root.edit-high-risk == "off" ? 2 : 0);
+                            picked(i) => { root.edit-high-risk = i == 1 ? "on" : (i == 2 ? "off" : "domain"); }
+                            width: 168px;
                         }
                         Rectangle { horizontal-stretch: 1; }
                         Button {
@@ -3389,6 +3526,7 @@ export component AppWindow inherits Window {
     in-out property <string> edit-whitelist: "";
     in-out property <string> edit-permission: "global";
     in-out property <string> edit-sandbox: "off";
+    in-out property <string> edit-high-risk: "domain";
     in-out property <string> session-filter: "";
 
     // 领域管理（#7.1/#7.2）
@@ -3472,6 +3610,9 @@ export component AppWindow inherits Window {
     callback task-delete(string);
     // 空间 + 会话（#9/#9.1/#14/#15）
     callback space-save(string);
+    callback space-pick(string);
+    callback open-workspace-dir(string);
+    callback init-workspace-dir(string);
     callback pick-dir(string);
     callback session-list(string);
     callback session-open(string);
@@ -3502,7 +3643,6 @@ export component AppWindow inherits Window {
     callback cfg-draft(string, string);
     callback cfg-save();
     // 空间工具组勾选（按组授权，能选择不手书）
-    callback space-pick(string);
     callback space-group-toggle(string);
 
     // 根布局显式铺满窗口：Window 里直接放布局时首选尺寸由子项决定，
@@ -3789,6 +3929,7 @@ export component AppWindow inherits Window {
                         edit-whitelist <=> root.edit-whitelist;
                         edit-permission <=> root.edit-permission;
                         edit-sandbox <=> root.edit-sandbox;
+                        edit-high-risk <=> root.edit-high-risk;
                         session-filter <=> root.session-filter;
                         switch-to(n) => { root.space-switch(n); }
                         create() => { root.space-create(root.new-space-name, root.new-space-note); }
@@ -3796,6 +3937,8 @@ export component AppWindow inherits Window {
                         space-save(n) => { root.space-save(n); }
                         space-pick(n) => { root.space-pick(n); }
                         space-toggle-group(id) => { root.space-group-toggle(id); }
+                        open-workspace-dir(n) => { root.open-workspace-dir(n); }
+                        init-workspace-dir(n) => { root.init-workspace-dir(n); }
                         pick-dir(k) => { root.pick-dir(k); }
                         session-list(f) => { root.session-list(f); }
                         session-open(id) => { root.session-open(id); }

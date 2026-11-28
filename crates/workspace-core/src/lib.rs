@@ -22,6 +22,21 @@ use toolkit_core::tools::{Tool, ToolResult};
 
 pub mod memory;
 
+/// 空间初始化时写入工作区根的 AGENTS.md 模板（已存在则不覆盖）。
+const AGENTS_TEMPLATE: &str = r#"# 工作区约定
+
+本目录是当前空间的工作区根：文件的读写、命令的执行都以这里为基准。
+
+- 脚本写 `scripts/`
+- 报告与交付产物写 `output/`
+- 数据文件写 `data/`
+- 本文件每轮都会被读取并作为「工作区指令」注入，修改后下一轮即生效
+
+## 项目说明
+
+（在这里补充项目背景、目录约定、验收标准与禁止事项）
+"#;
+
 #[derive(Debug, Error)]
 pub enum WsError {
     #[error("IO 错误: {0}")]
@@ -97,6 +112,11 @@ pub struct Workspace {
     /// UI 只暴露「启用 / 关闭」两项，None 在打开编辑面板时按全局当前值归一显示。
     #[serde(default)]
     pub sandbox_enabled: Option<bool>,
+    /// 高风险工具开关：None = 跟随领域 `[params] allow_high_risk`，
+    /// Some(true) = 本空间显式允许 High/Critical 工具（含子代理），
+    /// Some(false) = 本空间显式禁止（即使领域允许）。
+    #[serde(default)]
+    pub allow_high_risk: Option<bool>,
     #[serde(default)]
     pub created_at: u64,
     #[serde(default)]
@@ -104,6 +124,20 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// 高风险工具是否放行：空间显式设置优先，否则跟随领域默认。
+    pub fn high_risk_allowed(&self, domain_default: bool) -> bool {
+        self.allow_high_risk.unwrap_or(domain_default)
+    }
+
+    /// 高风险开关的展示态：`domain`（跟随领域）/ `on` / `off`。
+    pub fn high_risk_label(&self) -> &'static str {
+        match self.allow_high_risk {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "domain",
+        }
+    }
+
     /// 工具面白名单展开（B-3）：`plugins` 里的条目既可以是**组 id** 也可以是**工具名**。
     ///
     /// - `plugins` 为空 → 返回 `all_tools`（不设白名单）。
@@ -280,6 +314,75 @@ impl WorkspaceRegistry {
         memory::memory_dir(&self.root, name)
     }
 
+    /// 工作区根：空间配置了 cwd 用它，否则用空间目录 `root/<name>/`。
+    pub fn workspace_root_of(&self, name: &str) -> PathBuf {
+        match self.get(name) {
+            Some(w) if !w.cwd.trim().is_empty() => PathBuf::from(w.cwd.trim()),
+            _ => self.workspace_dir(name),
+        }
+    }
+
+    /// 校验工作区目录：拒绝盘根与程序目录（避免把 scripts/output 建到系统或安装目录里）。
+    pub fn validate_workspace_cwd(p: &Path) -> Result<(), WsError> {
+        let s = p.to_string_lossy();
+        let trimmed = s.trim_end_matches(['\\', '/']);
+        // 盘根：`D:` / `D:\`（trim 后长度为 2 且第二字符是冒号）
+        if trimmed.len() <= 2 && trimmed.as_bytes().get(1) == Some(&b':') {
+            return Err(WsError::Invalid(format!(
+                "工作区目录不能是盘根: {}",
+                p.display()
+            )));
+        }
+        if p.parent().is_none() {
+            return Err(WsError::Invalid(format!(
+                "工作区目录不能是盘根: {}",
+                p.display()
+            )));
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                if dir == p {
+                    return Err(WsError::Invalid(
+                        "工作区目录不能是程序安装目录（会与程序自带 scripts/ 冲突）".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 初始化空间目录骨架：工作区根下 `scripts/`（脚本）、`output/`（报告产物）、
+    /// `AGENTS.md`（工作区指令模板），以及空间数据目录下 `data/memory/`。
+    /// 已存在的文件/目录不覆盖；返回本次新建的路径（相对展示用）。
+    pub fn init_layout(&self, name: &str) -> Result<Vec<String>, WsError> {
+        let w = self
+            .get(name)
+            .ok_or_else(|| WsError::Invalid(format!("空间不存在: {name}")))?;
+        let root = self.workspace_root_of(name);
+        if !w.cwd.trim().is_empty() {
+            Self::validate_workspace_cwd(&root)?;
+        }
+        let mut created = Vec::new();
+        for sub in ["scripts", "output"] {
+            let d = root.join(sub);
+            if !d.is_dir() {
+                std::fs::create_dir_all(&d)?;
+                created.push(format!("{}/", root.join(sub).display()));
+            }
+        }
+        let agents = root.join("AGENTS.md");
+        if !agents.exists() {
+            std::fs::write(&agents, AGENTS_TEMPLATE)?;
+            created.push(agents.display().to_string());
+        }
+        let mem = self.memory_dir_of(name);
+        if !mem.is_dir() {
+            std::fs::create_dir_all(&mem)?;
+            created.push(mem.display().to_string());
+        }
+        Ok(created)
+    }
+
     /// 读取空间精炼笔记 MEMORY.md（无文件或无空间返回空串）。
     pub fn read_memory_curated(&self, name: &str) -> String {
         memory::read_curated(&self.root, name).unwrap_or_default()
@@ -334,8 +437,11 @@ impl WorkspaceRegistry {
         w.created_at = Self::now_secs();
         w.last_active = 0;
         std::fs::create_dir_all(self.data_dir(&w.name))?;
-        self.inner.write().expect("lock").workspaces.insert(w.name.clone(), w.clone());
+        let name = w.name.clone();
+        self.inner.write().expect("lock").workspaces.insert(name.clone(), w.clone());
         self.save()?;
+        // 骨架失败不阻断创建：工作区目录可能暂时不可写，UI 可再点「初始化目录」重试。
+        let _ = self.init_layout(&name);
         Ok(w)
     }
 
@@ -382,6 +488,8 @@ impl WorkspaceRegistry {
         };
         std::fs::create_dir_all(self.data_dir(name))?;
         self.save()?;
+        // 首次进入时补齐工作区骨架（已存在则不动）。
+        let _ = self.init_layout(name);
         Ok(snapshot)
     }
 
@@ -402,8 +510,16 @@ impl WorkspaceRegistry {
         if !existed {
             return Err(WsError::Invalid(format!("空间不存在: {}", w.name)));
         }
+        // 改了 cwd 先校验：盘根/程序目录会污染系统，直接拒绝（不落盘）。
+        if !w.cwd.trim().is_empty() {
+            Self::validate_workspace_cwd(&PathBuf::from(w.cwd.trim()))?;
+        }
+        let name = w.name.clone();
         self.inner.write().expect("lock").workspaces.insert(w.name.clone(), w);
-        self.save()
+        self.save()?;
+        // cwd 变更后补齐新工作区骨架；非 cwd 编辑时也幂等重建缺失目录。
+        let _ = self.init_layout(&name);
+        Ok(())
     }
 
     /// 读取空间用量统计（不存在则空表）。
@@ -459,6 +575,8 @@ fn ws_json(w: &Workspace, active: &str) -> Value {
         "name": w.name, "active": w.name == active,
         "permission": w.permission_label(),
         "sandbox": w.sandbox_enabled,
+        "high_risk": w.high_risk_label(),
+        "allow_high_risk": w.allow_high_risk,
         "perms": { "read": w.perms.read, "write": w.perms.write,
                    "network": w.perms.network, "exec": w.perms.exec },
         "llm_profile": w.llm_profile, "skills": w.skills,
@@ -480,6 +598,7 @@ impl Tool for WsCreate {
             "name":{"type":"string"},
             "unrestricted":{"type":"boolean","description":"权限模式：true=允许完全访问（解除全部访问限制），false/省略=默认继承全局授权"},
             "sandbox_enabled":{"type":"boolean","description":"沙箱：true=启用受限令牌，false=关闭，省略=跟随全局"},
+            "allow_high_risk":{"type":"boolean","description":"高风险工具：true=本空间允许 High/Critical（含子代理），false=禁止，省略=跟随领域"},
             "perms":{"type":"object"},
             "llm_profile":{"type":"string"},
             "skills":{"type":"array","items":{"type":"string"}},
@@ -512,13 +631,23 @@ impl Tool for WsCreate {
             created_at: 0, last_active: 0,
             unrestricted: args.get("unrestricted").and_then(Value::as_bool).unwrap_or(false),
             sandbox_enabled: args.get("sandbox_enabled").and_then(Value::as_bool),
+            allow_high_risk: args.get("allow_high_risk").and_then(Value::as_bool),
         };
         let reg = self.0.clone();
         let name2 = w.name.clone();
         match reg.create(w) {
-            Ok(w) => ToolResult::json(
-                format!("工作空间 `{}` 已创建（{}）", w.name, reg.workspace_dir(&w.name).display()),
-                ws_json(&w, ""), start.elapsed().as_millis() as u64),
+            Ok(w) => {
+                let root = reg.workspace_root_of(&w.name);
+                ToolResult::json(
+                    format!(
+                        "工作空间 `{}` 已创建，工作区：{}（脚本→scripts/，报告→output/）",
+                        w.name,
+                        root.display()
+                    ),
+                    ws_json(&w, ""),
+                    start.elapsed().as_millis() as u64,
+                )
+            }
             Err(e) => ToolResult::error(format!("创建空间 `{name2}` 失败: {e}"), start.elapsed().as_millis() as u64),
         }
     }
@@ -565,9 +694,10 @@ impl Tool for WsSwitch {
             Ok(w) => {
                 let mut v = ws_json(&w, name);
                 v["active"] = json!(true);
+                let root = reg.workspace_root_of(name);
                 ToolResult::json(
-                    format!("已切换到工作空间 `{}`（权限 {} · LLM {} · 技能 {} 个）",
-                        w.name, w.permission_label(),
+                    format!("已切换到工作空间 `{}`（工作区 {} · 权限 {} · LLM {} · 技能 {} 个）",
+                        w.name, root.display(), w.permission_label(),
                         if w.llm_profile.is_empty() { "全局" } else { &w.llm_profile },
                         w.skills.len()),
                     v, start.elapsed().as_millis() as u64)
@@ -804,6 +934,7 @@ mod tests {
             created_at: 0, last_active: 0,
             unrestricted: false,
             sandbox_enabled: None,
+            allow_high_risk: None,
         }).unwrap();
         assert_eq!(w.name, "proj-a");
         assert!(reg.workspace_dir("proj-a").join("data").is_dir());
@@ -1018,6 +1149,54 @@ extra_deny = []
         assert_eq!(w.name, "legacy");
         assert!(!w.unrestricted);
         assert_eq!(w.sandbox_enabled, None);
+    }
+
+    #[test]
+    fn init_layout_creates_workspace_skeleton() {
+        let root = tmp_root("skeleton");
+        let reg = WorkspaceRegistry::open(&root).unwrap();
+        let ws_dir = root.join("proj");
+        let w = reg.create(Workspace {
+            name: "proj".into(),
+            cwd: ws_dir.display().to_string(),
+            ..Default::default()
+        }).unwrap();
+        assert!(ws_dir.join("scripts").is_dir(), "应创建 scripts/");
+        assert!(ws_dir.join("output").is_dir(), "应创建 output/");
+        assert!(ws_dir.join("AGENTS.md").is_file(), "应写入 AGENTS.md");
+        assert!(reg.memory_dir_of(&w.name).is_dir(), "应创建空间记忆目录");
+
+        // 再次初始化不覆盖用户改过的 AGENTS.md
+        std::fs::write(ws_dir.join("AGENTS.md"), "自定义指令").unwrap();
+        reg.init_layout("proj").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws_dir.join("AGENTS.md")).unwrap(),
+            "自定义指令"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn high_risk_space_overrides_domain() {
+        let w = Workspace { allow_high_risk: None, ..Default::default() };
+        assert!(w.high_risk_allowed(true), "跟随领域允许");
+        assert!(!w.high_risk_allowed(false), "跟随领域禁止");
+        assert_eq!(w.high_risk_label(), "domain");
+
+        let on = Workspace { allow_high_risk: Some(true), ..Default::default() };
+        assert!(on.high_risk_allowed(false), "空间允许应覆盖领域禁止");
+        assert_eq!(on.high_risk_label(), "on");
+
+        let off = Workspace { allow_high_risk: Some(false), ..Default::default() };
+        assert!(!off.high_risk_allowed(true), "空间禁止应覆盖领域允许");
+        assert_eq!(off.high_risk_label(), "off");
+    }
+
+    #[test]
+    fn validate_rejects_drive_root() {
+        assert!(WorkspaceRegistry::validate_workspace_cwd(Path::new("D:\\")).is_err());
+        assert!(WorkspaceRegistry::validate_workspace_cwd(Path::new("C:")).is_err());
+        assert!(WorkspaceRegistry::validate_workspace_cwd(Path::new("D:/work")).is_ok());
     }
 
     // 手工构造 ExecutionContext（kern-core 无 Default，与 feat-nuclei/feat-tasks 同款）

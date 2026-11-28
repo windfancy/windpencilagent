@@ -16,12 +16,27 @@ pub struct ToolRow {
     pub description: String,
 }
 
+/// 工作区里的一个文件/目录（空间页文件列表）。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FileRow {
+    pub name: String,
+    pub is_dir: bool,
+    /// 人类可读大小（目录为空串）
+    pub size: String,
+}
+
 /// 单个空间行（空间页）。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SpaceRow {
     pub name: String,
     pub active: bool,
     pub cwd: String,
+    /// 工作区根（cwd 为空时回落到空间数据目录）
+    pub root: String,
+    /// 工作区顶层文件（最多 100 条，目录在前）
+    pub files: Vec<FileRow>,
+    /// 顶层条目总数（可能大于 files.len()）
+    pub file_total: usize,
     pub trees: Vec<String>,
     /// 工具白名单明细（组 id / 工具名）
     pub whitelist: Vec<String>,
@@ -29,10 +44,59 @@ pub struct SpaceRow {
     pub permission: String,
     /// 沙箱：on / off（未显式设置时按全局归一）
     pub sandbox: String,
+    /// 高风险工具：domain（跟随领域）/ on / off
+    pub high_risk: String,
     /// 工具白名单条数（0 = 全部）
     pub plugins: usize,
     pub skills: usize,
     pub note: String,
+}
+
+/// 列出工作区顶层条目：目录在前、名称升序，最多 `limit` 条。
+/// 返回 (条目, 顶层总数)；读目录失败返回空（UI 显示"无法读取"由 root 判断）。
+pub fn list_workspace_files(root: &std::path::Path, limit: usize) -> (Vec<FileRow>, usize) {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return (Vec::new(), 0);
+    };
+    let mut dirs: Vec<FileRow> = Vec::new();
+    let mut files: Vec<FileRow> = Vec::new();
+    let mut total = 0usize;
+    for ent in rd.flatten() {
+        total += 1;
+        let name = ent.file_name().to_string_lossy().into_owned();
+        let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            if dirs.len() < limit {
+                dirs.push(FileRow { name, is_dir: true, size: String::new() });
+            }
+        } else if files.len() < limit {
+            let size = ent
+                .metadata()
+                .map(|m| human_size(m.len()))
+                .unwrap_or_default();
+            files.push(FileRow { name, is_dir: false, size });
+        }
+    }
+    dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    let mut out = dirs;
+    out.extend(files);
+    out.truncate(limit);
+    (out, total)
+}
+
+fn human_size(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    let f = n as f64;
+    if f < KB {
+        format!("{n}B")
+    } else if f < KB * KB {
+        format!("{:.1}KB", f / KB)
+    } else if f < KB * KB * KB {
+        format!("{:.1}MB", f / (KB * KB))
+    } else {
+        format!("{:.2}GB", f / (KB * KB * KB))
+    }
 }
 
 /// 单个模型档案行（模型页）。
@@ -252,5 +316,24 @@ mod tests {
         let mut row = RegGroupRow::default();
         row.description = "示例描述".to_string();
         assert_eq!(row.description, "示例描述");
+    }
+
+    #[test]
+    fn workspace_files_dirs_first_and_limited() {
+        let root = std::env::temp_dir().join(format!("wpa_snap_files_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("zeta")).unwrap();
+        std::fs::create_dir_all(root.join("alpha")).unwrap();
+        std::fs::write(root.join("b.txt"), "hello").unwrap();
+        std::fs::write(root.join("a.txt"), "hello world").unwrap();
+
+        let (files, total) = list_workspace_files(&root, 3);
+        assert_eq!(total, 4);
+        assert_eq!(files.len(), 3);
+        assert!(files[0].is_dir && files[0].name == "alpha", "目录在前且升序");
+        assert!(files[1].is_dir && files[1].name == "zeta");
+        assert_eq!(files[2].name, "a.txt");
+        assert_eq!(files[2].size, "11B");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

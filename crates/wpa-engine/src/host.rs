@@ -114,6 +114,8 @@ pub struct BaseRuntime {
     session_id: String,
     http: Arc<dyn HttpClient>,
     data_dir: Option<PathBuf>,
+    /// 空间工作区根（会话边界）：与 shell 默认 cwd、file 工具落点一致。
+    workspace_cwd: Option<PathBuf>,
     events: Mutex<Vec<(String, Value)>>,
     kv: Mutex<HashMap<(String, String), Value>>,
 }
@@ -124,9 +126,16 @@ impl BaseRuntime {
             session_id: session_id.into(),
             http: Arc::new(SharedHttp::new()),
             data_dir,
+            workspace_cwd: None,
             events: Mutex::new(Vec::new()),
             kv: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 绑定空间工作区根（装配期由 active workspace 的 cwd 注入）。
+    pub fn with_workspace_cwd(mut self, cwd: Option<PathBuf>) -> Self {
+        self.workspace_cwd = cwd;
+        self
     }
 
     /// 已发出的事件快照（审计/调试用）。
@@ -158,6 +167,10 @@ impl GroupRuntime for BaseRuntime {
 
     fn data_dir(&self) -> Option<PathBuf> {
         self.data_dir.clone()
+    }
+
+    fn workspace_cwd(&self) -> Option<PathBuf> {
+        self.workspace_cwd.clone()
     }
 
     async fn kv_get(&self, ns: &str, key: &str) -> Result<Option<Value>, String> {

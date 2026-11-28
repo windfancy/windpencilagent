@@ -24,7 +24,7 @@ use wpa_engine::{assemble, build_session, Base, SessionInfo, SessionOpts};
 use crate::{
     AppWindow, CapGroupRow, CfgCard, CfgItem, ChatMsg, DayRow, DomainCardRow, DomainGroupChip,
     KbStoreRow, RegEntryRow, RegGroupRow, KnowledgeRow, SessionRow, DomainExtRow,
-    ModelRow, SpaceRow, TaskRow, ToolRow, TraceRow,
+    ModelRow, SpaceRow, TaskRow, ToolRow, TraceRow, FileRow,
 };
 
 /// UI → 引擎 命令。
@@ -56,6 +56,10 @@ pub enum Cmd {
     SaveConfig,
     /// 空间编辑：点「编辑」时初始化组勾选 chips
     SpacePick(String),
+    /// 在工作区根打开资源管理器（让「空间目录」可直达）
+    OpenSpaceDir(String),
+    /// 初始化空间工作区骨架：scripts/、output/、AGENTS.md、空间记忆目录
+    InitSpaceDir(String),
     /// 空间编辑：勾选/取消一个工具组（按组授权，替代手输白名单）
     SpaceToggleGroup(String),
     /// 审批「本轮会话生效」：把工具加入当前会话白名单
@@ -112,6 +116,8 @@ pub enum Cmd {
         whitelist: String,
         permission: String,
         sandbox: String,
+        /// 高风险：domain / on / off
+        high_risk: String,
     },
     /// #9.1 会话管理（参数=空间过滤，空串=全部）
     SessionList(String),
@@ -499,20 +505,6 @@ fn apply_snapshot(base: &Base, window: &slint::Weak<AppWindow>) {
             desc: t.description.clone().into(),
         })
         .collect();
-    let spaces: Vec<SpaceRow> = snap
-        .spaces
-        .iter()
-        .map(|s| SpaceRow {
-            name: s.name.clone().into(),
-            active: s.active,
-            plugins: s.plugins as i32,
-            note: s.note.clone().into(),
-            cwd: s.cwd.clone().into(),
-            whitelist: s.whitelist.join("\n").into(),
-            permission: s.permission.clone().into(),
-            sandbox: s.sandbox.clone().into(),
-        })
-        .collect();
     let isolated: Vec<slint::SharedString> =
         snap.isolated.iter().map(|s| s.clone().into()).collect();
     // 知识/技能：技能按名字+触发场景列出；知识条目由当前领域 provider 提供（#7.2）
@@ -721,6 +713,34 @@ fn apply_snapshot(base: &Base, window: &slint::Weak<AppWindow>) {
         app.set_reg_groups(ModelRc::new(VecModel::from(reg_groups)));
         app.set_reg_entries(ModelRc::new(VecModel::from(reg_entries)));
         app.set_reg_summary(snap.reg_summary.as_str().into());
+        // 空间行含 ModelRc（文件列表，!Send），只能在 UI 线程里构建
+        let spaces: Vec<SpaceRow> = snap
+            .spaces
+            .iter()
+            .map(|s| SpaceRow {
+                name: s.name.clone().into(),
+                active: s.active,
+                plugins: s.plugins as i32,
+                note: s.note.clone().into(),
+                cwd: s.cwd.clone().into(),
+                root: s.root.clone().into(),
+                files: ModelRc::new(VecModel::from(
+                    s.files
+                        .iter()
+                        .map(|f| FileRow {
+                            name: f.name.clone().into(),
+                            is_dir: f.is_dir,
+                            size: f.size.clone().into(),
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+                file_total: s.file_total as i32,
+                whitelist: s.whitelist.join("\n").into(),
+                permission: s.permission.clone().into(),
+                sandbox: s.sandbox.clone().into(),
+                high_risk: s.high_risk.clone().into(),
+            })
+            .collect();
         app.set_spaces(ModelRc::new(VecModel::from(spaces)));
         app.set_models(ModelRc::new(VecModel::from(models)));
         // 任务看板四列：把同一份任务按 col 拆成四份下发（Slint 侧不做过滤）
@@ -1136,13 +1156,10 @@ impl Engine {
             Cmd::SwitchSpace(name) => {
                 match self.base.workspaces.switch(&name) {
                     Ok(w) => {
-                        self.session = None;
-                        self.ensure_session();
-                        apply_snapshot(&self.base, &self.window);
-                        if let Some(info) = self.info.clone() {
-                            self.apply_info(&info);
-                        }
-                        toast(&self.window, format!("已切换到空间 {}", w.name));
+                        // 工作区变了：file 工具根、shell 默认 cwd、AGENTS.md、空间白名单
+                        // 全在装配期决定 ⇒ 必须重新装配，只换会话会让工具仍指向旧目录。
+                        self.reload_tree();
+                        toast(&self.window, format!("已切换到空间 {}（工作区已重载）", w.name));
                     }
                     Err(e) => toast(&self.window, format!("切换失败：{e}")),
                 }
@@ -2136,7 +2153,7 @@ impl Engine {
             }
 
             // #9 空间编辑保存
-            Cmd::SpaceSave { name, cwd, whitelist, permission, sandbox } => {
+            Cmd::SpaceSave { name, cwd, whitelist, permission, sandbox, high_risk } => {
                 let Some(mut w) = self.base.workspaces.get(&name) else {
                     toast(&self.window, format!("空间 {name} 不存在"));
                     return;
@@ -2147,17 +2164,52 @@ impl Engine {
                 w.unrestricted = permission == "unrestricted";
                 // 沙箱二值：on / off（UI 只有两项）
                 w.sandbox_enabled = Some(sandbox == "on");
+                // 高风险三态：domain（跟随领域）/ on / off
+                w.allow_high_risk = match high_risk.as_str() {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    _ => None,
+                };
                 match self.base.workspaces.update(w) {
                     Ok(()) => {
-                        // 空间级策略改了要重建会话（授权/审批/沙箱在会话构建时生效）
-                        self.session = None;
-                        self.ensure_session();
-                        apply_snapshot(&self.base, &self.window);
-                        toast(&self.window, format!("空间 {name} 已保存"));
+                        // 空间级策略 / cwd 变了：必须是全新装配（file 工具根、shell 默认 cwd、
+                        // AGENTS.md 工作区都在装配期固化，只重建会话不生效）。
+                        self.reload_tree();
+                        toast(&self.window, format!("空间 {name} 已保存（已重新装配）"));
                     }
                     Err(e) => toast(&self.window, format!("保存失败：{e}")),
                 }
             }
+
+            // 打开工作区目录（资源管理器直达）
+            Cmd::OpenSpaceDir(name) => {
+                let root = self.base.workspaces.workspace_root_of(&name);
+                if let Err(e) = std::fs::create_dir_all(&root) {
+                    toast(&self.window, format!("打开目录失败：{e}"));
+                    return;
+                }
+                #[cfg(windows)]
+                let spawned = std::process::Command::new("explorer").arg(&root).spawn();
+                #[cfg(not(windows))]
+                let spawned = std::process::Command::new("xdg-open").arg(&root).spawn();
+                if let Err(e) = spawned {
+                    toast(&self.window, format!("打开目录失败：{e}"));
+                }
+            }
+
+            // 初始化工作区骨架（scripts/、output/、AGENTS.md、空间记忆）
+            Cmd::InitSpaceDir(name) => match self.base.workspaces.init_layout(&name) {
+                Ok(v) => {
+                    // 目录可能刚从"不存在"变为可用：重新装配让 file/shell 用上新工作区。
+                    self.reload_tree();
+                    if v.is_empty() {
+                        toast(&self.window, "工作区骨架已存在，无需初始化");
+                    } else {
+                        toast(&self.window, format!("已初始化工作区（新建 {} 项）", v.len()));
+                    }
+                }
+                Err(e) => toast(&self.window, format!("初始化失败：{e}")),
+            },
 
             // #9.1 会话管理
             Cmd::SessionList(filter) => {

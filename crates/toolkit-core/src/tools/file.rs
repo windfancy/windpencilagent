@@ -1,8 +1,10 @@
 //! 文件读写工具：file.read / file.write。
 //!
-//! 落点白名单 = exe 同级 `scripts/`、`data/` 下相对路径（工作空间 cwd 不可得，暂不开放）；
-//! 禁 `..`、绝对路径、盘符、反斜杠转义。file.write 是脚本落盘入口
-//! 「写 Python 脚本进 scripts/」的入口，配合 sandbox.pip + sandbox.python 形成闭环。
+//! 落点 = 当前工作区根（空间 cwd；无 cwd 时回落 exe 同级目录）。
+//! - `file.read` 默认允许任意路径（含工作区外绝对路径）：读不改变系统状态，用户已拍板放开；
+//! - `file.write` 默认只允许工作区根下 `scripts/`、`output/`、`data/` 相对路径；
+//!   工作区外写入默认拒绝，仅空间「允许完全访问」时放开（绝对路径）。
+//! 相对路径禁 `..`、盘符与反斜杠转义；保留 8.3 短名 / junction / canonicalize 三层围栏。
 
 use std::path::{Path, PathBuf};
 
@@ -16,9 +18,26 @@ use crate::tools::{Tool, ToolResult};
 /// 读回给 LLM 的全文上限（256KB，防上下文爆炸）。
 const READ_LIMIT: usize = 256 * 1024;
 
-/// 解析白名单相对路径：仅允许 `scripts/`、`data/` 前缀，禁 `..`/绝对路径/盘符。
-/// 返回 root 下的绝对路径。
-fn resolve_whitelisted(root: &Path, rel: &str) -> Result<PathBuf, String> {
+/// 工作区根下允许写入的子目录（相对路径前缀，小写匹配）。
+const WRITE_PREFIXES: &[&str] = &["scripts/", "output/", "data/"];
+
+/// 判断是否"绝对路径形态"：`/x`、`\x`、`C:`（含 UNC `\\server\share`）。
+fn looks_absolute(s: &str) -> bool {
+    let b = s.as_bytes();
+    s.starts_with('/')
+        || s.starts_with('\\')
+        || (b.len() > 1 && b[1] == b':')
+}
+
+/// 统一斜杠后拼接根目录，并做三层围栏校验。
+fn join_under(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let normalized = rel.replace('\\', "/");
+    let joined = root.join(&normalized);
+    fence_check(root, &joined)
+}
+
+/// 解析写白名单相对路径：仅允许 `scripts/`、`output/`、`data/` 前缀，禁 `..`/盘符。
+fn resolve_writable(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let s = rel.trim();
     if s.is_empty() {
         return Err("path 为空".into());
@@ -26,28 +45,23 @@ fn resolve_whitelisted(root: &Path, rel: &str) -> Result<PathBuf, String> {
     if s.contains("..") {
         return Err(format!("path 禁止包含 `..`: {rel}"));
     }
-    if s.starts_with('/') || s.starts_with('\\') || s.contains('\0') {
-        return Err(format!("path 须为 scripts/ 或 data/ 下相对路径: {rel}"));
+    if s.contains('\0') {
+        return Err(format!("path 含非法字符: {rel}"));
     }
-    // 盘符：C: / c:\ 等（第二字符为冒号即视为 Windows 盘符）
     let bytes = s.as_bytes();
     if s.contains(':') && !(bytes.len() > 1 && bytes[1] == b':') {
-        // 单冒号出现在其他位置同样可疑（如 data/a:b）——统一拒绝
         return Err(format!("path 禁止包含盘符或冒号: {rel}"));
     }
     if bytes.len() > 1 && bytes[1] == b':' {
         return Err(format!("path 禁止绝对路径/盘符: {rel}"));
     }
-    // 前缀白名单
-    let lower = s.to_ascii_lowercase();
-    if !(lower.starts_with("scripts/") || lower.starts_with("scripts\\")
-        || lower.starts_with("data/") || lower.starts_with("data\\")) {
-        return Err(format!("path 仅允许 scripts/ 或 data/ 下相对路径: {rel}"));
+    let lower = s.replace('\\', "/").to_ascii_lowercase();
+    if !WRITE_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+        return Err(format!(
+            "path 仅允许工作区下 scripts/、output/、data/ 相对路径: {rel}"
+        ));
     }
-    // 统一用正斜杠拼路径，避免反斜杠绕过前缀检查
-    let normalized = s.replace('\\', "/");
-    let joined = root.join(&normalized);
-    fence_check(root, &joined)
+    join_under(root, s)
 }
 
 /// R4-5（dsh X5 路径围栏强化）：三层检查——
@@ -137,9 +151,29 @@ impl FileReadTool {
     pub fn new() -> Self {
         Self { root: default_root() }
     }
-    /// 注入根目录（测试用；生产为 exe 同级目录）。
+    /// 注入工作区根（生产为当前空间 cwd；测试亦可）。
     pub fn with_root(root: PathBuf) -> Self {
         Self { root }
+    }
+
+    /// 读路径解析：绝对路径默认允许（用户拍板：file.read 默认放开）；
+    /// 相对路径按工作区根解析，仍禁 `..` 与 NUL。
+    fn resolve(&self, rel: &str) -> Result<PathBuf, String> {
+        let s = rel.trim();
+        if s.is_empty() {
+            return Err("path 为空".into());
+        }
+        if s.contains('\0') {
+            return Err(format!("path 含非法字符: {rel}"));
+        }
+        if looks_absolute(s) {
+            let p = PathBuf::from(s);
+            return Ok(p.canonicalize().unwrap_or(p));
+        }
+        if s.contains("..") {
+            return Err(format!("path 禁止包含 `..`: {rel}"));
+        }
+        join_under(&self.root, s)
     }
 }
 
@@ -153,15 +187,15 @@ impl Default for FileReadTool {
 impl Tool for FileReadTool {
     fn name(&self) -> &str { "file.read" }
     fn description(&self) -> String {
-        "读取文件（多编码自动识别，UTF-8/GBK/Big5）：落点白名单为 exe 同级 scripts/、data/ 下相对路径，\
-禁 .. / 绝对路径 / 盘符。全文上限 256KB。用途：读回脚本输出、检查下载内容。低风险。".into()
+        "读取文件（多编码自动识别，UTF-8/GBK/Big5）。path 可为工作区内相对路径，也可为绝对路径\
+（默认允许读工作区外文件）。全文上限 256KB。用途：读回脚本输出、检查项目文件与下载内容。低风险。".into()
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "required": ["path"],
             "properties": {
-                "path": {"type": "string", "description": "相对路径，仅允许 scripts/ 或 data/ 前缀，如 scripts/recon.py、data/downloads/report.html"}
+                "path": {"type": "string", "description": "工作区内相对路径（如 scripts/recon.py、output/report.md），或绝对路径"}
             }
         })
     }
@@ -177,7 +211,7 @@ impl Tool for FileReadTool {
         let Some(rel) = args.get("path").and_then(Value::as_str) else {
             return ToolResult::error("缺少参数 path", ms());
         };
-        let path = match resolve_whitelisted(&self.root, rel) {
+        let path = match self.resolve(rel) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(e, ms()),
         };
@@ -207,18 +241,44 @@ impl Tool for FileReadTool {
     }
 }
 
-/// Tool: file.write —— 写白名单内文件（自动建父目录）。
+/// Tool: file.write —— 写工作区内文件（自动建父目录）。
 pub struct FileWriteTool {
     root: PathBuf,
+    /// 是否允许工作区外写入（仅空间「允许完全访问」时为 true）。
+    allow_outside: bool,
 }
 
 impl FileWriteTool {
     pub fn new() -> Self {
-        Self { root: default_root() }
+        Self { root: default_root(), allow_outside: false }
     }
-    /// 注入根目录（测试用；生产为 exe 同级目录）。
+    /// 注入工作区根（生产为当前空间 cwd；测试亦可）。
     pub fn with_root(root: PathBuf) -> Self {
-        Self { root }
+        Self { root, allow_outside: false }
+    }
+    /// 完全访问空间：放开工作区外写入（绝对路径）。
+    pub fn with_allow_outside(mut self, allow: bool) -> Self {
+        self.allow_outside = allow;
+        self
+    }
+
+    /// 写路径解析：默认只允许工作区根下 scripts//output//data/；
+    /// 绝对路径必须 allow_outside（完全访问），否则拒绝。
+    fn resolve(&self, rel: &str) -> Result<PathBuf, String> {
+        let s = rel.trim();
+        if looks_absolute(s) {
+            if !self.allow_outside {
+                return Err(format!(
+                    "拒绝写入工作区外路径（{}）：当前空间未开启「允许完全访问」",
+                    rel.trim()
+                ));
+            }
+            if s.contains('\0') {
+                return Err(format!("path 含非法字符: {rel}"));
+            }
+            return Ok(PathBuf::from(s));
+        }
+        resolve_writable(&self.root, s)
     }
 }
 
@@ -232,8 +292,8 @@ impl Default for FileWriteTool {
 impl Tool for FileWriteTool {
     fn name(&self) -> &str { "file.write" }
     fn description(&self) -> String {
-        "写文件（把脚本写进 scripts/ 后用 sandbox.python 执行）：\
-落点白名单为 exe 同级 scripts/、data/ 下相对路径，禁 .. / 绝对路径 / 盘符；自动创建父目录，覆盖写。\
+        "写文件到当前工作区：默认只允许 scripts/（脚本）、output/（报告/产物）、data/（数据）下相对路径；\
+禁 .. / 盘符；自动创建父目录，覆盖写。工作区外绝对路径默认拒绝，仅空间「允许完全访问」时放开。\
 参数：path(必填)、content(必填)、overwrite(可选,bool,默认 true)。返回写入字节数。中风险。".into()
     }
     fn input_schema(&self) -> Value {
@@ -241,7 +301,7 @@ impl Tool for FileWriteTool {
             "type": "object",
             "required": ["path", "content"],
             "properties": {
-                "path": {"type": "string", "description": "相对路径，仅允许 scripts/ 或 data/ 前缀，如 scripts/scan.py"},
+                "path": {"type": "string", "description": "工作区内相对路径：脚本写 scripts/x.py，报告写 output/report.md，数据写 data/x.csv"},
                 "content": {"type": "string", "description": "写入的文本内容"},
                 "overwrite": {"type": "boolean", "description": "目标已存在时是否覆盖，默认 true"}
             }
@@ -259,7 +319,7 @@ impl Tool for FileWriteTool {
             return ToolResult::error("缺少参数 content", ms());
         };
         let overwrite = args.get("overwrite").and_then(Value::as_bool).unwrap_or(true);
-        let path = match resolve_whitelisted(&self.root, rel) {
+        let path = match self.resolve(rel) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(e, ms()),
         };
@@ -321,15 +381,66 @@ mod tests {
     #[tokio::test]
     async fn whitelist_rejects() {
         let t = FileWriteTool::with_root(PathBuf::from("/fake"));
-        for bad in ["../etc/x.py", "a/../b.py", "C:\\x.py", "D:/x.py", "/abs/x.py", "\\abs\\x.py", "other/x.txt", "scripts2/a.py", ""] {
+        for bad in [
+            "../etc/x.py", "a/../b.py", "C:\\x.py", "D:/x.py", "/abs/x.py",
+            "\\abs\\x.py", "other/x.txt", "scripts2/a.py", "",
+        ] {
             let r = t.call(&ctx(), json!({"path": bad, "content": "x"})).await;
             assert!(!r.ok, "应拒绝 {bad}");
         }
         let rt = FileReadTool::with_root(PathBuf::from("/fake"));
-        for bad in ["..", "C:x", "foo.py"] {
+        for bad in ["", "..", "a/../b", "scripts/\0x"] {
             let r = rt.call(&ctx(), json!({"path": bad})).await;
             assert!(!r.ok, "应拒绝 {bad}");
         }
+    }
+
+    /// file.read 默认允许读工作区外绝对路径（用户拍板）。
+    #[tokio::test]
+    async fn read_allows_outside_absolute_path() {
+        let root = tmp_root("read_inside");
+        let outside = tmp_root("read_outside");
+        std::fs::write(outside.join("note.txt"), "外部文件").unwrap();
+        let rt = FileReadTool::with_root(root.clone());
+        let abs = outside.join("note.txt").display().to_string();
+        let r = rt.call(&ctx(), json!({"path": abs})).await;
+        assert!(r.ok, "{}", r.summary);
+        assert_eq!(r.detail.unwrap()["content"].as_str().unwrap(), "外部文件");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// file.write 默认拒绝工作区外；完全访问空间放开。
+    #[tokio::test]
+    async fn write_outside_denied_unless_unrestricted() {
+        let root = tmp_root("write_inside");
+        let outside = tmp_root("write_outside");
+        let target = outside.join("evil.txt").display().to_string();
+
+        let w = FileWriteTool::with_root(root.clone());
+        let r = w.call(&ctx(), json!({"path": target, "content": "x"})).await;
+        assert!(!r.ok, "默认应拒绝工作区外写入");
+
+        let w = FileWriteTool::with_root(root.clone()).with_allow_outside(true);
+        let r = w.call(&ctx(), json!({"path": target, "content": "x"})).await;
+        assert!(r.ok, "完全访问应允许：{}", r.summary);
+        assert!(outside.join("evil.txt").is_file());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// 产物约定：报告写 output/、脚本写 scripts/，均落在当前工作区根。
+    #[tokio::test]
+    async fn write_artifacts_under_workspace() {
+        let root = tmp_root("artifacts");
+        let w = FileWriteTool::with_root(root.clone());
+        for p in ["output/report.md", "scripts/scan.py", "data/raw.csv"] {
+            let r = w.call(&ctx(), json!({"path": p, "content": "ok"})).await;
+            assert!(r.ok, "{p}: {}", r.summary);
+            assert!(root.join(p).is_file(), "应落在工作区：{p}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// R4-5：8.3 短文件名拒绝（`ABCDEF~1` 可绕过前缀白名单）。
@@ -340,13 +451,13 @@ mod tests {
         std::fs::create_dir_all(root.join("scripts")).unwrap();
         for bad in ["scripts/abcdef~1", "data/CFG~1.TXT", "scripts/x~9/y.py"] {
             assert!(
-                resolve_whitelisted(&root, bad).is_err(),
+                resolve_writable(&root, bad).is_err(),
                 "应拒绝 8.3 短名: {bad}"
             );
         }
         // 正常名不受影响（~ 出现在词中且后缀非纯数字不算短名）
-        assert!(resolve_whitelisted(&root, "scripts/a~b.txt").is_ok());
-        assert!(resolve_whitelisted(&root, "scripts/report~final.txt").is_ok());
+        assert!(resolve_writable(&root, "scripts/a~b.txt").is_ok());
+        assert!(resolve_writable(&root, "scripts/report~final.txt").is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 

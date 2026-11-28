@@ -431,20 +431,29 @@ impl ChatSession {
         };
         let id = match self.persist_id.clone() {
             Some(id) => id,
-            None => match store.create(
-                &base_store::SessionRecord::title_from(input),
-                &self.persist_space,
-                &self.persist_profile,
-            ) {
-                Ok(rec) => {
-                    self.persist_id = Some(rec.id.clone());
-                    rec.id
+            None => {
+                // 会话归属记录：创建时的工作区根（执行期仍以当前装配为准）
+                let cwd = self
+                    .workspace_root
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                match store.create_in(
+                    &base_store::SessionRecord::title_from(input),
+                    &self.persist_space,
+                    &self.persist_profile,
+                    &cwd,
+                ) {
+                    Ok(rec) => {
+                        self.persist_id = Some(rec.id.clone());
+                        rec.id
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "会话登记失败（记忆层降级为不落盘）");
+                        return;
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "会话登记失败（记忆层降级为不落盘）");
-                    return;
-                }
-            },
+            }
         };
         // role：0=用户 1=智能体（见 base_store::StoredMessage）
         let lines = [
@@ -1759,6 +1768,7 @@ impl ChatSession {
    ① 优先使用已注册工具；\n\
    ② 确实没有对应工具时才使用系统命令（os.exec / shell.run），且不得借外部程序替代已注册能力；\n\
    ③ 仍不足时，用 file.write 写脚本，必要时先安装依赖，再用 sandbox.python 执行。\n\
+   文件落点：脚本写 scripts/，报告与交付产物写 output/，数据写 data/；相对路径以当前工作区根为准。\n\
 4. 工具失败先判断是否重试（同参数最多重试 2 次）；重试仍失败则记录原因，换工具或推进其他子任务；\
 系统提示连续失败 3 次时必须调整方向或终止。\n\
 5. 每轮评估是否已满足停止条件：信息足够即停止调用工具，输出最终结论。\n\n\

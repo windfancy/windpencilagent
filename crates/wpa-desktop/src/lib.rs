@@ -383,6 +383,7 @@ fn run_inner(config_path: PathBuf) -> anyhow::Result<()> {
                 whitelist: a.get_edit_whitelist().to_string(),
                 permission: a.get_edit_permission().to_string(),
                 sandbox: a.get_edit_sandbox().to_string(),
+                high_risk: a.get_edit_high_risk().to_string(),
             });
         });
     }
@@ -405,6 +406,15 @@ fn run_inner(config_path: PathBuf) -> anyhow::Result<()> {
     {
         let h = handle.tx.clone();
         app.on_space_group_toggle(move |id| { let _ = h.send(Cmd::SpaceToggleGroup(id.to_string())); });
+    }
+    // 工作区：打开目录 / 初始化骨架
+    {
+        let h = handle.tx.clone();
+        app.on_open_workspace_dir(move |name| { let _ = h.send(Cmd::OpenSpaceDir(name.to_string())); });
+    }
+    {
+        let h = handle.tx.clone();
+        app.on_init_workspace_dir(move |name| { let _ = h.send(Cmd::InitSpaceDir(name.to_string())); });
     }
     // 会话管理
     {

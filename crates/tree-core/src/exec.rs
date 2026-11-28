@@ -96,7 +96,8 @@ impl DeclarativeTool {
             workspace_name: String::new(),
             workspace_cwd: req
                 .runtime
-                .data_dir()
+                .workspace_cwd()
+                .or_else(|| req.runtime.data_dir())
                 .map(|d| d.display().to_string())
                 .unwrap_or_default(),
             profile,

@@ -56,6 +56,10 @@ pub struct SessionRecord {
     pub workspace: String,
     /// 创建时的模型 profile 名（空=未配置）
     pub profile: String,
+    /// 创建时的工作区根（空间 cwd；空=未绑定）。仅作归属记录：
+    /// 执行期仍以当前装配的工作区为准，避免打开旧会话时跨目录写入。
+    #[serde(default)]
+    pub cwd: String,
     pub turns: u64,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -121,6 +125,17 @@ impl SessionStore {
         workspace: &str,
         profile: &str,
     ) -> Result<SessionRecord, StoreError> {
+        self.create_in(title, workspace, profile, "")
+    }
+
+    /// 新建会话并记录工作区根（空间 cwd）。
+    pub fn create_in(
+        &self,
+        title: &str,
+        workspace: &str,
+        profile: &str,
+        cwd: &str,
+    ) -> Result<SessionRecord, StoreError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -130,6 +145,7 @@ impl SessionStore {
             title: title.to_string(),
             workspace: workspace.to_string(),
             profile: profile.to_string(),
+            cwd: cwd.to_string(),
             turns: 0,
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -397,6 +413,26 @@ mod tests {
         assert!(store.delete(&a.id).unwrap());
         assert!(!store.delete(&a.id).unwrap());
         assert_eq!(store.all().len(), 1);
+    }
+
+    #[test]
+    fn legacy_record_without_cwd_deserializes() {
+        // 旧会话 JSON 没有 cwd 字段：必须能读回，且不会丢其他字段。
+        let json = r#"{"id":"old","title":"旧会话","workspace":"ws","profile":"p",
+            "turns":1,"prompt_tokens":2,"completion_tokens":3,
+            "created_ms":0,"updated_ms":0,"messages":[]}"#;
+        let rec: SessionRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(rec.cwd, "");
+        assert_eq!(rec.workspace, "ws");
+        assert_eq!(rec.title, "旧会话");
+    }
+
+    #[test]
+    fn create_in_records_workspace_cwd() {
+        let store = SessionStore::open_tmp().unwrap();
+        let rec = store.create_in("T", "ws", "p", "D:/work").unwrap();
+        assert_eq!(rec.cwd, "D:/work");
+        assert_eq!(store.get(&rec.id).unwrap().cwd, "D:/work");
     }
 
     #[test]

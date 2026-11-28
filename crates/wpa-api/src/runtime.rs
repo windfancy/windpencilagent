@@ -86,6 +86,12 @@ pub trait GroupRuntime: Send + Sync + 'static {
         None
     }
 
+    /// 当前工作区根（空间 cwd）：插件/树包做文件落点时的基准目录。
+    /// None 表示未绑定工作区，调用方应回落 `data_dir()` 或程序目录。
+    fn workspace_cwd(&self) -> Option<PathBuf> {
+        None
+    }
+
     /// 共享键值存储读取（命名空间隔离；默认不支持）。
     async fn kv_get(&self, _ns: &str, _key: &str) -> Result<Option<Value>, String> {
         Ok(None)

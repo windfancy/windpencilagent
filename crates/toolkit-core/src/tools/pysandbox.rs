@@ -149,7 +149,7 @@ pub struct PyRunResult {
     pub duration_ms: u64,
 }
 
-/// 沙箱执行（共享引擎，供 Tool 与未来组件调用）。
+/// 沙箱执行（共享引擎，供 Tool 与未来组件调用）。root 固定为 exe 同级。
 pub async fn run_script(
     ctx: &ExecutionContext,
     script: &str,
@@ -157,19 +157,32 @@ pub async fn run_script(
     stdin: Option<&str>,
     timeout_ms: u64,
 ) -> Result<PyRunResult, PySandboxError> {
-    let root = app_root();
+    run_script_in(ctx, &app_root(), script, args, stdin, timeout_ms).await
+}
+
+/// 指定根目录执行：脚本位于 `<root>/scripts/`，解释器与环境仍来自 exe 根。
+pub async fn run_script_in(
+    ctx: &ExecutionContext,
+    root: &Path,
+    script: &str,
+    args: &[String],
+    stdin: Option<&str>,
+    timeout_ms: u64,
+) -> Result<PyRunResult, PySandboxError> {
+    // 解释器始终来自程序目录（随包 python/），脚本根可指向工作区。
+    let app = app_root();
     let interp = find_interpreter_with_override(
-        &root,
+        &app,
         env_override("WPA_PYTHON_PATH").as_deref(),
     )
     .ok_or(PySandboxError::InterpreterMissing)?;
-    let script_path = resolve_script(&root, script)?;
+    let script_path = resolve_script(root, script)?;
     let timeout = timeout_ms.clamp(1000, MAX_TIMEOUT_MS);
-    let scripts = scripts_root(&root);
+    let scripts = scripts_root(root);
 
     // PYTHONPATH = scripts/ + exe 同级 site-packages/（存在才追加，sandbox.pip 安装目标）
     let mut py_paths = vec![scripts.to_string_lossy().into_owned()];
-    let site_packages = root.join("site-packages");
+    let site_packages = app.join("site-packages");
     if site_packages.is_dir() {
         py_paths.push(site_packages.to_string_lossy().into_owned());
     }
@@ -241,18 +254,30 @@ pub async fn run_script_restricted(
     args: &[String],
     timeout_ms: u64,
 ) -> Result<PyRunResult, PySandboxError> {
-    let root = app_root();
+    run_script_restricted_in(ctx, &app_root(), script, args, timeout_ms).await
+}
+
+/// 指定根目录的受限执行：脚本位于 `<root>/scripts/`。
+pub async fn run_script_restricted_in(
+    ctx: &ExecutionContext,
+    root: &Path,
+    script: &str,
+    args: &[String],
+    timeout_ms: u64,
+) -> Result<PyRunResult, PySandboxError> {
+    // 解释器始终来自程序目录（随包 python/），脚本根可指向工作区。
+    let app = app_root();
     let interp = find_interpreter_with_override(
-        &root,
+        &app,
         env_override("WPA_PYTHON_PATH").as_deref(),
     )
     .ok_or(PySandboxError::InterpreterMissing)?;
-    let script_path = resolve_script(&root, script)?;
+    let script_path = resolve_script(root, script)?;
     let timeout = timeout_ms.clamp(1000, MAX_TIMEOUT_MS);
-    let scripts = scripts_root(&root);
+    let scripts = scripts_root(root);
 
     let mut py_paths = vec![scripts.to_string_lossy().into_owned()];
-    let site_packages = root.join("site-packages");
+    let site_packages = app.join("site-packages");
     if site_packages.is_dir() {
         py_paths.push(site_packages.to_string_lossy().into_owned());
     }
@@ -305,6 +330,8 @@ pub async fn run_script_restricted(
 #[derive(Default)]
 pub struct PySandboxTool {
     restricted: bool,
+    /// 脚本根所在工作区（None = exe 同级目录，兼容旧行为）。
+    workspace_root: Option<PathBuf>,
 }
 
 impl PySandboxTool {
@@ -312,13 +339,21 @@ impl PySandboxTool {
         self.restricted = restricted;
         self
     }
+    /// 指定脚本根所在工作区：脚本落在 `<root>/scripts/`。
+    pub fn with_workspace_root(mut self, root: Option<PathBuf>) -> Self {
+        self.workspace_root = root;
+        self
+    }
+    fn root(&self) -> PathBuf {
+        self.workspace_root.clone().unwrap_or_else(app_root)
+    }
 }
 
 #[async_trait]
 impl Tool for PySandboxTool {
     fn name(&self) -> &str { "sandbox.python" }
     fn description(&self) -> String {
-        "Python 运行沙箱：在 exe 同级 scripts/ 目录内执行 .py 脚本（解释器来自随包 python/），\
+        "Python 运行沙箱：在当前工作区 scripts/ 目录内执行 .py 脚本（解释器来自随包 python/），\
 argv 直传、限时、输出截断、审计留痕。script 与 code 二选一：script 为 scripts/ 下相对路径（禁 .. / 绝对路径）；\
 code 为内联源码（自动落盘 scripts/_inline_<hash>.py 后执行）。依赖可先用 sandbox.pip 安装。\
 风险按内容判定：脚本路径默认免审；内联代码命中破坏性/逃逸模式需人工审批。".into()
@@ -352,7 +387,7 @@ code 为内联源码（自动落盘 scripts/_inline_<hash>.py 后执行）。依
                 // inline code：内容 hash 前 8 位命名，覆盖写，防落盘路径注入（文件名纯 hash）
                 match args.get("code").and_then(Value::as_str) {
                     Some(c) if !c.trim().is_empty() => {
-                        let root = app_root();
+                        let root = self.root();
                         let mut hasher = DefaultHasher::new();
                         c.hash(&mut hasher);
                         let name = format!("_inline_{:08x}.py", (hasher.finish() >> 32) as u32);
@@ -380,9 +415,11 @@ code 为内联源码（自动落盘 scripts/_inline_<hash>.py 后执行）。依
         let run = if crate::sandbox::effective_restricted(self.restricted)
             && crate::sandbox::app_container_enabled()
         {
-            run_script_restricted(ctx, &script, &argv, timeout_ms).await
+            let root = self.root();
+            run_script_restricted_in(ctx, &root, &script, &argv, timeout_ms).await
         } else {
-            run_script(ctx, &script, &argv, stdin, timeout_ms).await
+            let root = self.root();
+            run_script_in(ctx, &root, &script, &argv, stdin, timeout_ms).await
         };
         match run {
             Ok(r) => {
