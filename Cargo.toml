@@ -28,7 +28,7 @@ members = [
 # 2) 基座不认识任何专业领域词汇，只认 wpa-api 的群组契约。
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.92"
 # Apache-2.0：允许商用、修改、再分发，需保留版权与许可声明。

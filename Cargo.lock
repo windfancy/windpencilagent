@@ -26,7 +26,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base-llm",
@@ -407,7 +407,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "base-llm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "kern-core",
@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "base-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "browser-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-util",
  "net-core",
@@ -1007,7 +1007,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "data-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "kern-core",
@@ -2726,7 +2726,7 @@ dependencies = [
 
 [[package]]
 name = "kern-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "indexmap",
@@ -2754,7 +2754,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "knowledge-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -3162,7 +3162,7 @@ dependencies = [
 
 [[package]]
 name = "net-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "kern-core",
@@ -3879,11 +3879,11 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plugin-abi"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "plugin-host"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "libloading",
@@ -4608,7 +4608,7 @@ dependencies = [
 
 [[package]]
 name = "shell-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "kern-core",
@@ -5149,7 +5149,7 @@ dependencies = [
 
 [[package]]
 name = "text-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5486,7 +5486,7 @@ checksum = "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a"
 
 [[package]]
 name = "toolkit-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base-store",
@@ -5608,7 +5608,7 @@ dependencies = [
 
 [[package]]
 name = "tree-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "knowledge-core",
@@ -6645,7 +6645,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "kern-core",
@@ -6659,7 +6659,7 @@ dependencies = [
 
 [[package]]
 name = "wpa-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -6671,7 +6671,7 @@ dependencies = [
 
 [[package]]
 name = "wpa-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-core",
  "anyhow",
@@ -6687,7 +6687,7 @@ dependencies = [
 
 [[package]]
 name = "wpa-desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-core",
  "anyhow",
@@ -6707,7 +6707,7 @@ dependencies = [
 
 [[package]]
 name = "wpa-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-core",
  "anyhow",
@@ -6742,7 +6742,7 @@ dependencies = [
 
 [[package]]
 name = "wpa-kit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
 ]
