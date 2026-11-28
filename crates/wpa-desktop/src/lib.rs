@@ -380,9 +380,8 @@ fn run_inner(config_path: PathBuf) -> anyhow::Result<()> {
             let _ = h.send(Cmd::SpaceSave {
                 name: name.to_string(),
                 cwd: a.get_edit_cwd().to_string(),
-                authorized: a.get_edit_authorized().to_string(),
                 whitelist: a.get_edit_whitelist().to_string(),
-                approval: a.get_edit_approval().to_string(),
+                permission: a.get_edit_permission().to_string(),
                 sandbox: a.get_edit_sandbox().to_string(),
             });
         });

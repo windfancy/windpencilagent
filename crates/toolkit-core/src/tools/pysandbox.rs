@@ -377,7 +377,7 @@ code 为内联源码（自动落盘 scripts/_inline_<hash>.py 后执行）。依
         let stdin = args.get("stdin").and_then(Value::as_str);
         let timeout_ms = args.get("timeout_secs").and_then(Value::as_u64)
             .map(|v| v.saturating_mul(1000)).unwrap_or(DEFAULT_TIMEOUT_MS);
-        let run = if self.restricted {
+        let run = if crate::sandbox::effective_restricted(self.restricted) {
             run_script_restricted(ctx, &script, &argv, timeout_ms).await
         } else {
             run_script(ctx, &script, &argv, stdin, timeout_ms).await

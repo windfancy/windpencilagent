@@ -38,6 +38,9 @@ pub enum ScopeRule {
     /// 单标签主机名，如 `localhost` / `dc01` / `intranet`：**只做全等匹配**。
     /// 不能按域后缀处理——否则规则 `cn` 会顺带授权 `anything.cn`。
     HostName(String),
+    /// 通配一切（`*`）。仅用于用户显式选择「允许完全访问」时注入，
+    /// 表达"不限制任何目标"。空授权清单仍是 fail-closed，绝不等价于本规则。
+    Any,
 }
 
 impl ScopeRule {
@@ -46,6 +49,10 @@ impl ScopeRule {
         let raw = raw.trim();
         if raw.is_empty() {
             return Err(ScopeViolation::InvalidRule(raw.into()));
+        }
+        // 通配一切：仅"完全访问"模式会注入该规则。
+        if raw == "*" {
+            return Ok(Self::Any);
         }
         if let Some((ip, prefix)) = raw.split_once('/') {
             let prefix = prefix
@@ -90,10 +97,13 @@ impl ScopeRule {
             Self::Domain(d) | Self::HostName(d) => !d.is_empty(),
             Self::WildcardDomain(d) => d.len() > 1,
             Self::Host(d) => !d.to_string().is_empty(),
+            Self::Any => true,
         }
     }
     pub fn matches(&self, target: &str) -> bool {
         match self {
+            // 完全访问：任何目标都算在授权范围内。
+            Self::Any => true,
             Self::CidrV4 { net, prefix } => target
                 .parse::<Ipv4Addr>()
                 .map(|ip| cidr_v4_contains(*net, *prefix, ip))
@@ -315,6 +325,18 @@ mod tests {
         assert!(g.check_target("10.26.1.42").is_err());
         assert!(g.check_target("192.168.1.5").is_ok());
         assert!(g.check_target("192.168.1.6").is_err());
+    }
+
+    #[test]
+    fn any_rule_allows_everything_but_empty_still_fails_closed() {
+        // `*` = 完全访问：任何目标都放行（含被 deny 的，deny 由上层在完全访问时清空）
+        let g = ScopeGuard::from_lists(&["*".into()], &[]).unwrap();
+        assert!(g.check_target("10.0.0.5").is_ok());
+        assert!(g.check_target("a.gov.cn").is_ok());
+        assert!(g.check_target("example.com").is_ok());
+        // 空授权 ≠ 完全访问
+        let empty = ScopeGuard::from_lists(&[], &[]).unwrap();
+        assert!(empty.check_target("10.0.0.5").is_err());
     }
 
     #[test]

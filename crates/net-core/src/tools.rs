@@ -265,14 +265,18 @@ impl Tool for NetReach {
                 let detail = json!({
                     "host": r.host,
                     "alive": alive,
+                    // 本次实际扫描的端口（回显，避免被误读成"忽略 ports 参数"）
+                    "ports": ports.clone(),
+                    "scanned": ports.len(),
                     "open_ports": r.open.iter().map(|p| p.port).collect::<Vec<_>>(),
                     "resolved": r.resolved,
                 });
                 ToolResult::json(
                     format!(
-                        "{} {}（开放端口：{}）",
+                        "{} {}（扫描 {} 个端口，开放端口：{}）",
                         host,
                         if alive { "可达" } else { "不可达或全端口过滤" },
+                        ports.len(),
                         if r.open.is_empty() {
                             "无".to_string()
                         } else {
@@ -643,5 +647,19 @@ mod tests {
             .await;
         assert!(r.ok, "不可达应正常返回结果而非报错：{}", r.summary);
         assert!(r.summary.contains("不可达"));
+    }
+
+    #[tokio::test]
+    async fn reach_echoes_scanned_ports() {
+        // 回显本次请求的端口，避免被误读成"忽略 ports 参数"
+        let r = NetReach
+            .call(&ctx(), json!({"host":"127.0.0.1","ports":"3306,6379,3389","timeout_ms":200}))
+            .await;
+        assert!(r.ok);
+        let d = r.detail.expect("应有 detail");
+        let ports: Vec<u64> = d["ports"].as_array().unwrap().iter()
+            .filter_map(serde_json::Value::as_u64).collect();
+        assert_eq!(ports, vec![3306, 3389, 6379]);
+        assert_eq!(d["scanned"].as_u64(), Some(3));
     }
 }

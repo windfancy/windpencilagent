@@ -17,7 +17,6 @@ import { Card } from "kit/components/card.slint";
 import { Slider } from "kit/components/slider.slint";
 import { Checkbox } from "kit/components/checkbox.slint";
 import { Textarea } from "kit/components/textarea.slint";
-import { Combobox } from "kit/components/combobox.slint";
 import { Table, TableColumn } from "kit/components/table.slint";
 import { Dialog } from "kit/components/dialog.slint";
 import { Stepper } from "kit/components/stepper.slint";
@@ -99,18 +98,15 @@ export struct RegEntryRow {
 export struct SpaceRow {
     name: string,
     active: bool,
-    scope: int,
     plugins: int,
     note: string,
     /// 绑定的本地目录（shell/文件工具落点）
     cwd: string,
-    /// 授权目标（Rust 侧用换行拼好）
-    authorized: string,
     /// 工具白名单（Rust 侧用换行拼好）
     whitelist: string,
-    /// 空间级审批：true 自动批准 / false 逐次询问 / null 跟随全局（用 "auto"/"ask"/"global" 三态字串下发）
-    approval: string,
-    /// 空间级沙箱：同上三态
+    /// 权限模式："global"（默认继承全局）/ "unrestricted"（允许完全访问）
+    permission: string,
+    /// 沙箱："on" / "off"
     sandbox: string,
 }
 
@@ -441,9 +437,9 @@ component ChipSelect inherits Rectangle {
 
 component ChatPage {
     in property <[ChatMsg]> messages;
-    // 自动滚屏：Rust 侧推送新消息后把 viewport-y 置到超大值（Slint 自动 clamp 到底）
-    in-out property <length> scroll-y;
     in property <bool> busy;
+    // 消息条数变化触发自动滚屏（changed 只能监听属性，不能监听 .length 路径）
+    property <int> msg-count: root.messages.length;
     in property <string> model-name;
     in property <string> tree-name;
     in property <int> tool-count;
@@ -576,7 +572,6 @@ component ChatPage {
             ScrollView {
                 vertical-stretch: 1;
                 content-width: self.width;
-                content-y <=> root.scroll-y;
 
                 VerticalLayout {
                     padding-left: 24px;
@@ -605,10 +600,23 @@ component ChatPage {
                             }
                         }
                     }
+                    // 哨兵：消息变化后让这一行可见 = 滚到最新内容
+                    chat-tail := Rectangle { height: 1px; }
                 }
             }
         }
     }
+
+    // 延迟一帧再滚：此时新消息的 content-height 已重算，ensure-visible 能算对底部
+    chat-scroll-timer := Timer {
+        interval: 16ms;
+        running: false;
+        triggered => {
+            chat-tail.ensure-visible(ScrollBehavior.instant);
+            self.running = false;
+        }
+    }
+    changed msg-count => { chat-scroll-timer.running = true; }
 }
 
 // ---------------------------------------------------------------------------
@@ -817,6 +825,54 @@ component TaskPage {
 // 页面：空间
 // ---------------------------------------------------------------------------
 
+/// 两档分段选择器：明确显示两项，当前项高亮（避免下拉框显示占位符）。
+component Seg2 inherits Rectangle {
+    in property <string> a-label;
+    in property <string> b-label;
+    /// true = 选中第二项
+    in property <bool> b-selected: false;
+    callback picked(bool);
+
+    height: 26px;
+    border-radius: 6px;
+    background: Theme.palette.surface;
+    border-width: 1px;
+    border-color: Theme.palette.border;
+
+    HorizontalLayout {
+        padding: 2px;
+        spacing: 2px;
+        Rectangle {
+            horizontal-stretch: 1;
+            height: 100%;
+            border-radius: 4px;
+            background: !root.b-selected ? Theme.palette.primary : transparent;
+            Text {
+                text: root.a-label;
+                color: !root.b-selected ? Theme.palette.on_primary : Theme.palette.text_secondary;
+                font-size: 11px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            TouchArea { clicked => { root.picked(false); } }
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+            height: 100%;
+            border-radius: 4px;
+            background: root.b-selected ? Theme.palette.primary : transparent;
+            Text {
+                text: root.b-label;
+                color: root.b-selected ? Theme.palette.on_primary : Theme.palette.text_secondary;
+                font-size: 11px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            TouchArea { clicked => { root.picked(true); } }
+        }
+    }
+}
+
 component SpacePage {
     in property <[SpaceRow]> spaces;
     in property <[CapGroupRow]> groups;
@@ -827,9 +883,8 @@ component SpacePage {
     // 空间编辑表单（选中空间后回填）
     in-out property <string> edit-space;
     in-out property <string> edit-cwd;
-    in-out property <string> edit-authorized;
     in-out property <string> edit-whitelist;
-    in-out property <string> edit-approval;
+    in-out property <string> edit-permission;
     in-out property <string> edit-sandbox;
     in-out property <string> session-filter;
 
@@ -904,10 +959,11 @@ component SpacePage {
             }
 
             Text {
-                text: "空间 = 独立目录 + 授权范围 + 模型绑定 + 树包/工具白名单 + 记忆。切换空间后新建会话生效。";
+                text: "空间 = 独立目录 + 权限模式 + 沙箱开关 + 模型绑定 + 工具白名单 + 记忆。切换空间后新建会话生效。";
                 color: Theme.palette.text_secondary;
                 font-size: 12px;
                 wrap: word-wrap;
+                min-height: 18px;
             }
 
             ScrollView {
@@ -936,7 +992,9 @@ component SpacePage {
                                     font-weight: 600;
                                 }
                                 Text {
-                                    text: "授权目标 " + s.scope + " 条 · 白名单 " + s.plugins + " 条"
+                                    text: (s.permission == "unrestricted" ? "完全访问" : "默认全局")
+                                        + " · 沙箱" + (s.sandbox == "on" ? "开" : "关")
+                                        + " · 白名单 " + s.plugins + " 条"
                                         + (s.note == "" ? "" : " · " + s.note);
                                     color: Theme.palette.text_secondary;
                                     font-size: 11px;
@@ -958,9 +1016,8 @@ component SpacePage {
                                 clicked => {
                                     root.edit-space = s.name;
                                     root.edit-cwd = s.cwd;
-                                    root.edit-authorized = s.authorized;
                                     root.edit-whitelist = s.whitelist;
-                                    root.edit-approval = s.approval;
+                                    root.edit-permission = s.permission;
                                     root.edit-sandbox = s.sandbox;
                                     root.space-pick(s.name);
                                     root.session-filter = s.name;
@@ -993,89 +1050,93 @@ component SpacePage {
 
             // 空间编辑面板（点"编辑"后出现）
             if root.edit-space != "" : Rectangle {
-                height: 300px;
+                // 高度随内容：固定高度会留大片空白并挤压控件
+                height: edit-body.preferred-height + 24px;
                 border-radius: 8px;
                 border-width: 1px;
                 border-color: Theme.palette.primary;
                 background: Theme.palette.surface_raised;
-                VerticalLayout {
-                    padding: 12px;
-                    spacing: 6px;
+                edit-body := VerticalLayout {
+                    x: 12px;
+                    y: 12px;
+                    width: parent.width - 24px;
+                    spacing: 8px;
+
                     Text {
-                        text: "编辑空间：" + root.edit-space + "（目录 = shell/文件工具落点；审批/沙箱留空跟随全局）";
+                        text: "编辑空间：" + root.edit-space;
                         color: Theme.palette.text_primary;
                         font-size: 12px;
                         font-weight: 600;
+                        wrap: word-wrap;
                     }
+                    Text {
+                        text: "目录 = shell/文件工具的工作落点；权限与沙箱在此单独设定，保存后新建会话生效。";
+                        color: Theme.palette.text_disabled;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+
                     HorizontalLayout {
                         spacing: 8px;
                         Text { text: "本地目录"; width: 66px; color: Theme.palette.text_secondary; font-size: 11px; vertical-alignment: center; }
                         Input { text <=> root.edit-cwd; placeholder-text: "留空 = 程序数据目录"; height: 30px; horizontal-stretch: 1; }
                         Button { text: "浏览…"; width: 68px; height: 30px; outlined: true; clicked => { root.pick-dir("space-cwd"); } }
                     }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        VerticalLayout {
-                            horizontal-stretch: 1; spacing: 2px;
-                            Text { text: "授权目标（一行一条）"; color: Theme.palette.text_secondary; font-size: 11px; }
-                            TextEdit { text <=> root.edit-authorized; height: 52px; wrap: word-wrap; }
+
+                    // 工具组白名单整行独占：避免与其它列对半分导致挤压/错位
+                    VerticalLayout {
+                        spacing: 4px;
+                        Text {
+                            text: "工具组白名单（点选授权；0 组 = 全部）；下方可手输精确工具名";
+                            color: Theme.palette.text_secondary;
+                            font-size: 11px;
+                            overflow: elide;
                         }
-                        VerticalLayout {
-                            horizontal-stretch: 1; spacing: 2px;
-                            Text { text: "工具组白名单（勾选授权，0 组 = 全部）；下方可手输精确工具名"; color: Theme.palette.text_secondary; font-size: 11px; }
-                            // 按组勾选（能选择不手书）
-                            Flickable {
-                                height: 46px;
-                                content-width: max(self.width, 1px);
-                                VerticalLayout {
-                                    width: parent.width;
-                                    spacing: 3px;
-                                    HorizontalLayout {
-                                        spacing: 4px;
-                                        for g[i] in root.group-chips : Rectangle {
-                                            visible: i < 6;
-                                            height: 20px;
-                                            border-radius: 4px;
-                                            background: g.declared ? Theme.palette.primary : Theme.palette.surface;
-                                            HorizontalLayout { padding-left: 6px; padding-right: 6px;
-                                                Text { text: g.label; color: g.declared ? Theme.palette.on_primary : Theme.palette.text_secondary; font-size: 10px; vertical-alignment: center; }
-                                            }
-                                            TouchArea { clicked => { root.space-toggle-group(g.id); } }
-                                        }
-                                    }
-                                    HorizontalLayout {
-                                        spacing: 4px;
-                                        for g[i] in root.group-chips : Rectangle {
-                                            visible: i >= 6;
-                                            height: 20px;
-                                            border-radius: 4px;
-                                            background: g.declared ? Theme.palette.primary : Theme.palette.surface;
-                                            HorizontalLayout { padding-left: 6px; padding-right: 6px;
-                                                Text { text: g.label; color: g.declared ? Theme.palette.on_primary : Theme.palette.text_secondary; font-size: 10px; vertical-alignment: center; }
-                                            }
-                                            TouchArea { clicked => { root.space-toggle-group(g.id); } }
-                                        }
+                        chips-flow := FlexboxLayout {
+                            width: parent.width;
+                            spacing: 4px;
+                            spacing-vertical: 4px;
+                            flex-wrap: wrap;
+                            alignment: start;
+                            for g in root.group-chips : Rectangle {
+                                height: 22px;
+                                min-width: 54px;
+                                border-radius: 11px;
+                                background: g.declared ? Theme.palette.primary : Theme.palette.surface;
+                                HorizontalLayout {
+                                    padding-left: 8px;
+                                    padding-right: 8px;
+                                    Text {
+                                        text: g.label;
+                                        color: g.declared ? Theme.palette.on_primary : Theme.palette.text_secondary;
+                                        font-size: 10px;
+                                        vertical-alignment: center;
                                     }
                                 }
+                                TouchArea { clicked => { root.space-toggle-group(g.id); } }
                             }
-                            TextEdit { text <=> root.edit-whitelist; height: 40px; wrap: word-wrap; }
                         }
+                        TextEdit { text <=> root.edit-whitelist; height: 40px; wrap: word-wrap; }
                     }
+
+                    // 权限 / 沙箱：两档分段选择（不再用会显示 Search... 的下拉框）
                     HorizontalLayout {
                         spacing: 8px;
                         Text { text: "权限"; width: 36px; color: Theme.palette.text_secondary; font-size: 11px; vertical-alignment: center; }
-                        Combobox {
-                            options: ["默认全局权限", "允许完全访问"];
-                            selected-index: root.edit-approval == "auto" ? 1 : 0;
-                            width: 120px; height: 26px;
-                            selected(i, v) => { root.edit-approval = i == 1 ? "auto" : "global"; }
+                        Seg2 {
+                            a-label: "默认全局";
+                            b-label: "允许完全访问";
+                            b-selected: root.edit-permission == "unrestricted";
+                            picked(b) => { root.edit-permission = b ? "unrestricted" : "global"; }
+                            width: 196px;
                         }
                         Text { text: "沙箱"; width: 36px; color: Theme.palette.text_secondary; font-size: 11px; vertical-alignment: center; }
-                        Combobox {
-                            options: ["global", "strict", "relaxed"];
-                            selected-index: root.edit-sandbox == "strict" ? 1 : (root.edit-sandbox == "relaxed" ? 2 : 0);
-                            width: 120px; height: 26px;
-                            selected(i, v) => { root.edit-sandbox = v; }
+                        Seg2 {
+                            a-label: "关闭";
+                            b-label: "启用";
+                            b-selected: root.edit-sandbox == "on";
+                            picked(b) => { root.edit-sandbox = b ? "on" : "off"; }
+                            width: 132px;
                         }
                         Rectangle { horizontal-stretch: 1; }
                         Button {
@@ -1675,8 +1736,8 @@ component ModelPage {
 
 component RightRail {
     in property <[TraceRow]> traces;
-    // 自动滚屏：轨迹新增后置底
-    in-out property <length> scroll-y;
+    // 轨迹条数变化触发自动滚屏
+    property <int> trace-count: root.traces.length;
     in property <[TaskRow]> tasks;
     in property <string> status-line;
     in property <int> tool-count;
@@ -1729,7 +1790,6 @@ component RightRail {
                 clip: true;
                 ScrollView {
                     content-width: self.width;
-                    content-y <=> root.scroll-y;
                     VerticalLayout {
                         padding: 8px;
                         spacing: 4px;
@@ -1754,6 +1814,8 @@ component RightRail {
                             color: Theme.palette.text_disabled;
                             font-size: 11px;
                         }
+                        // 哨兵：轨迹变化后滚到最新
+                        trace-tail := Rectangle { height: 1px; }
                     }
                 }
             }
@@ -1767,6 +1829,16 @@ component RightRail {
             }
         }
     }
+
+    trace-scroll-timer := Timer {
+        interval: 16ms;
+        running: false;
+        triggered => {
+            trace-tail.ensure-visible(ScrollBehavior.instant);
+            self.running = false;
+        }
+    }
+    changed trace-count => { trace-scroll-timer.running = true; }
 }
 
 
@@ -2445,52 +2517,54 @@ component DomainPage inherits Rectangle {
                         }
                     }
                     Rectangle {
-                        // TouchArea 的首选高度是 0，用 preferred 计算会把容器塌成 16px 边框
-                        height: 40px;
                         border-radius: 8px;
                         border-width: 1px;
                         border-color: Theme.palette.border;
                         background: Theme.palette.surface_raised;
-                        chips := HorizontalLayout {
+                        // 自动换行：FlexboxLayout 的 flex-wrap 默认 wrap。
+                        // 组多时自动折行、容器随之增高，不再溢出遮住下方卡片。
+                        chips := FlexboxLayout {
                             x: 8px;
                             y: 8px;
                             width: parent.width - 16px;
                             spacing: 6px;
+                            spacing-vertical: 6px;
+                            flex-wrap: wrap;
                             alignment: start;
-                            for c in root.group-chips : TouchArea {
-                                // 布局项 TouchArea 的首选宽高都是 0，必须显式给尺寸
+                            for c in root.group-chips : Rectangle {
                                 width: 124px;
                                 height: 24px;
-                                mouse-cursor: pointer;
+                                border-radius: 12px;
+                                border-width: c.declared ? 0px : 1px;
+                                border-color: Theme.palette.border;
+                                background: c.declared
+                                    ? (c.enabled ? Theme.palette.primary : Theme.palette.border)
+                                    : Theme.palette.surface;
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    Text {
+                                        text: (c.declared ? "✓ " : "") + c.label + (c.enabled ? "" : "（全局禁用）");
+                                        color: !c.enabled
+                                            ? Theme.palette.text_disabled
+                                            : (c.declared ? Theme.palette.on_primary : Theme.palette.text_secondary);
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
                                 // 全局已禁用的组只能看、不能引：领域不能替全局做决定
-                                clicked => { if c.enabled { root.toggle-group(c.id); } }
-                                Rectangle {
+                                TouchArea {
                                     x: 0;
                                     y: 0;
                                     width: 100%;
                                     height: 100%;
-                                    border-radius: 12px;
-                                    border-width: c.declared ? 0px : 1px;
-                                    border-color: Theme.palette.border;
-                                    background: c.declared
-                                        ? (c.enabled ? Theme.palette.primary : Theme.palette.border)
-                                        : Theme.palette.surface;
-                                    HorizontalLayout {
-                                        padding-left: 10px;
-                                        padding-right: 10px;
-                                        Text {
-                                            text: (c.declared ? "✓ " : "") + c.label + (c.enabled ? "" : "（全局禁用）");
-                                            color: !c.enabled
-                                                ? Theme.palette.text_disabled
-                                                : (c.declared ? Theme.palette.on_primary : Theme.palette.text_secondary);
-                                            font-size: 11px;
-                                            vertical-alignment: center;
-                                            overflow: elide;
-                                        }
-                                    }
+                                    mouse-cursor: pointer;
+                                    clicked => { if c.enabled { root.toggle-group(c.id); } }
                                 }
                             }
                         }
+                        height: chips.preferred-height + 16px;
                     }
 
                     // 未引用任何组 = 不做收敛（兼容老领域）。必须显性提示，
@@ -3053,21 +3127,22 @@ component AbilityPage inherits Rectangle {
                     font-size: 11px;
                 }
                 if root.sel-id != "" && root.cur-group != "" && root.sel-installed : Rectangle {
-                    height: 36px;
                     border-radius: 8px;
                     border-width: 1px;
                     border-color: Theme.palette.border;
                     background: Theme.palette.surface_raised;
-                    chips2 := HorizontalLayout {
+                    // 自动换行 + 高度随行数（组多时不再溢出）
+                    chips2 := FlexboxLayout {
                         x: 8px;
                         y: 6px;
                         width: parent.width - 16px;
                         spacing: 6px;
+                        spacing-vertical: 6px;
+                        flex-wrap: wrap;
                         alignment: start;
                         for g in groups : Rectangle {
-                            // 当前组不显示（就是它自己）
-                            visible: g.id != root.sel-group;
                             height: 24px;
+                            min-width: 48px;
                             border-radius: 12px;
                             background: Theme.palette.surface;
                             HorizontalLayout {
@@ -3086,10 +3161,12 @@ component AbilityPage inherits Rectangle {
                                 width: 100%;
                                 height: 100%;
                                 mouse-cursor: pointer;
-                                clicked => { root.op(root.sel-id, "move:" + g.id); }
+                                // 当前组就是它自己：点了不改动
+                                clicked => { if g.id != root.sel-group { root.op(root.sel-id, "move:" + g.id); } }
                             }
                         }
                     }
+                    height: chips2.preferred-height + 12px;
                 }
 
                 // 组级操作
@@ -3192,9 +3269,6 @@ export component AppWindow inherits Window {
     // 数据模型
     in-out property <[ChatMsg]> messages: [];
     in-out property <[TraceRow]> traces: [];
-    // 自动滚屏位置（Rust 侧推送后置超大值，Slint clamp 到底部；用户上翻不受影响）
-    in-out property <length> chat-scroll-y: 0px;
-    in-out property <length> trace-scroll-y: 0px;
     in-out property <[ToolRow]> tools: [];
     in-out property <[SpaceRow]> spaces: [];
     in-out property <[ModelRow]> models: [];
@@ -3294,10 +3368,9 @@ export component AppWindow inherits Window {
     // 空间编辑（#9/#14/#15）
     in-out property <string> edit-space: "";
     in-out property <string> edit-cwd: "";
-    in-out property <string> edit-authorized: "";
     in-out property <string> edit-whitelist: "";
-    in-out property <string> edit-approval: "global";
-    in-out property <string> edit-sandbox: "global";
+    in-out property <string> edit-permission: "global";
+    in-out property <string> edit-sandbox: "off";
     in-out property <string> session-filter: "";
 
     // 领域管理（#7.1/#7.2）
@@ -3566,7 +3639,6 @@ export component AppWindow inherits Window {
                         y: 0;
                         width: view-area.width;
                         height: view-area.height;
-                        scroll-y <=> root.chat-scroll-y;
                         messages: root.messages;
                         busy: root.busy;
                         model-name: root.model-name;
@@ -3696,9 +3768,8 @@ export component AppWindow inherits Window {
                         new-note <=> root.new-space-note;
                         edit-space <=> root.edit-space;
                         edit-cwd <=> root.edit-cwd;
-                        edit-authorized <=> root.edit-authorized;
                         edit-whitelist <=> root.edit-whitelist;
-                        edit-approval <=> root.edit-approval;
+                        edit-permission <=> root.edit-permission;
                         edit-sandbox <=> root.edit-sandbox;
                         session-filter <=> root.session-filter;
                         switch-to(n) => { root.space-switch(n); }
@@ -3905,7 +3976,6 @@ export component AppWindow inherits Window {
                 y: 0;
                 width: parent.width;
                 height: parent.height;
-                scroll-y <=> root.trace-scroll-y;
                 traces: root.traces;
                 tasks: root.tasks;
                 status-line: root.status-line;

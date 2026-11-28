@@ -67,12 +67,6 @@ impl WorkspacePerms {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Workspace {
     pub name: String,
-    /// ScopeGuard 授权目标（空 = 继承全局 config）
-    #[serde(default)]
-    pub scope: Vec<String>,
-    /// 显式拒绝目标
-    #[serde(default)]
-    pub deny: Vec<String>,
     #[serde(default)]
     pub perms: WorkspacePerms,
     /// 关联 LLM profile 名（空 = 用全局 active）
@@ -94,18 +88,15 @@ pub struct Workspace {
     /// 简述
     #[serde(default)]
     pub note: String,
-    /// 工具审批是否自动通过：None = 跟随全局配置。
+    /// 权限模式：false = 默认全局（继承全局授权范围），true = 允许完全访问
+    /// （解除全部限制：授权范围、拒绝清单、知识约束红线一律跳过）。
     #[serde(default)]
-    pub auto_approve: Option<bool>,
-    /// 是否启用受限 token：None = 跟随全局配置。
+    pub unrestricted: bool,
+    /// 沙箱开关：None = 跟随全局 `[sandbox] restricted_token`，
+    /// Some(true) = 启用受限令牌沙箱，Some(false) = 关闭。
+    /// UI 只暴露「启用 / 关闭」两项，None 在打开编辑面板时按全局当前值归一显示。
     #[serde(default)]
-    pub restricted_token: Option<bool>,
-    /// 空间追加的授权目标（与全局 scope 合并）。
-    #[serde(default)]
-    pub extra_scope: Vec<String>,
-    /// 空间追加的红线目标（与全局 deny 合并）。
-    #[serde(default)]
-    pub extra_deny: Vec<String>,
+    pub sandbox_enabled: Option<bool>,
     #[serde(default)]
     pub created_at: u64,
     #[serde(default)]
@@ -154,36 +145,45 @@ impl Workspace {
         self.trees.is_empty() || self.trees.iter().any(|t| t == tree_id)
     }
 
-    /// 生效授权目标：全局 + 空间追加，去重（保持顺序：全局优先）。
+    /// 生效授权目标：默认全局 = 直接继承全局清单；完全访问 = 通配一切（`*`）。
+    ///
+    /// 注意：这里**不能**用"清空清单"表达完全访问——`ScopeGuard` 对空授权是
+    /// fail-closed（拒绝一切），只有显式 `Any` 规则才表示"不限制目标"。
     pub fn effective_scope(&self, global: &[String]) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for s in global.iter().chain(self.extra_scope.iter()) {
-            if !out.contains(s) {
-                out.push(s.clone());
-            }
+        if self.unrestricted {
+            vec!["*".to_string()]
+        } else {
+            global.to_vec()
         }
-        out
     }
 
-    /// 生效红线：全局 + 空间追加，去重（保持顺序：全局优先）。
+    /// 生效红线：默认全局 = 继承全局拒绝清单；完全访问 = 清空（不设任何红线）。
     pub fn effective_deny(&self, global: &[String]) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for s in global.iter().chain(self.extra_deny.iter()) {
-            if !out.contains(s) {
-                out.push(s.clone());
-            }
+        if self.unrestricted {
+            Vec::new()
+        } else {
+            global.to_vec()
         }
-        out
     }
 
-    /// 审批策略：空间没显式设置时跟随全局。
-    pub fn approval(&self, global: bool) -> bool {
-        self.auto_approve.unwrap_or(global)
+    /// 是否自动跳过审批：完全访问模式下无需逐次确认。
+    pub fn auto_approve(&self) -> bool {
+        self.unrestricted
     }
 
-    /// 受限 token 策略：空间没显式设置时跟随全局。
-    pub fn restricted(&self, global: bool) -> bool {
-        self.restricted_token.unwrap_or(global)
+    /// 生效沙箱开关：空间未显式设置时跟随全局。
+    pub fn effective_sandbox(&self, global: bool) -> bool {
+        self.sandbox_enabled.unwrap_or(global)
+    }
+
+    /// 权限展示值（给 UI 下拉用）：`"unrestricted"` / `"global"`。
+    pub fn permission_label(&self) -> &'static str {
+        if self.unrestricted { "unrestricted" } else { "global" }
+    }
+
+    /// 沙箱展示值（给 UI 下拉用）：`"on"` / `"off"`（未设置时按全局归一）。
+    pub fn sandbox_label(&self, global: bool) -> &'static str {
+        if self.effective_sandbox(global) { "on" } else { "off" }
     }
 }
 
@@ -457,7 +457,8 @@ impl Component for WorkspaceComponent {
 fn ws_json(w: &Workspace, active: &str) -> Value {
     json!({
         "name": w.name, "active": w.name == active,
-        "scope": w.scope, "deny": w.deny,
+        "permission": w.permission_label(),
+        "sandbox": w.sandbox_enabled,
         "perms": { "read": w.perms.read, "write": w.perms.write,
                    "network": w.perms.network, "exec": w.perms.exec },
         "llm_profile": w.llm_profile, "skills": w.skills,
@@ -472,13 +473,13 @@ pub struct WsCreate(pub Arc<WorkspaceRegistry>);
 impl Tool for WsCreate {
     fn name(&self) -> &str { "ws.create" }
     fn description(&self) -> String {
-        "创建工作空间（Profile 装配清单）：独立目录、Scope 范围、LLM profile、技能列表、空间工作目录 cwd、启用工具白名单 plugins（dsh 语义：非空时按清单装配，空=全部）。".into()
+        "创建工作空间（Profile 装配清单）：独立目录、权限模式（默认全局/完全访问）、沙箱开关、LLM profile、技能列表、空间工作目录 cwd、启用工具白名单 plugins（dsh 语义：非空时按清单装配，空=全部）。".into()
     }
     fn input_schema(&self) -> Value {
         json!({"type":"object","required":["name"],"properties":{
             "name":{"type":"string"},
-            "scope":{"type":"array","items":{"type":"string"}},
-            "deny":{"type":"array","items":{"type":"string"}},
+            "unrestricted":{"type":"boolean","description":"权限模式：true=允许完全访问（解除全部访问限制），false/省略=默认继承全局授权"},
+            "sandbox_enabled":{"type":"boolean","description":"沙箱：true=启用受限令牌，false=关闭，省略=跟随全局"},
             "perms":{"type":"object"},
             "llm_profile":{"type":"string"},
             "skills":{"type":"array","items":{"type":"string"}},
@@ -495,12 +496,6 @@ impl Tool for WsCreate {
         let perms = args.get("perms").map(WorkspacePerms::parse).unwrap_or_default();
         let w = Workspace {
             name,
-            scope: args.get("scope").and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
-                .unwrap_or_default(),
-            deny: args.get("deny").and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
-                .unwrap_or_default(),
             perms,
             llm_profile: args.get("llm_profile").and_then(Value::as_str).unwrap_or("").into(),
             skills: args.get("skills").and_then(Value::as_array)
@@ -515,10 +510,8 @@ impl Tool for WsCreate {
                 .unwrap_or_default(),
             note: args.get("note").and_then(Value::as_str).unwrap_or("").into(),
             created_at: 0, last_active: 0,
-            auto_approve: None,
-            restricted_token: None,
-            extra_scope: Vec::new(),
-            extra_deny: Vec::new(),
+            unrestricted: args.get("unrestricted").and_then(Value::as_bool).unwrap_or(false),
+            sandbox_enabled: args.get("sandbox_enabled").and_then(Value::as_bool),
         };
         let reg = self.0.clone();
         let name2 = w.name.clone();
@@ -573,8 +566,8 @@ impl Tool for WsSwitch {
                 let mut v = ws_json(&w, name);
                 v["active"] = json!(true);
                 ToolResult::json(
-                    format!("已切换到工作空间 `{}`（Scope {} 条 · LLM {} · 技能 {} 个）",
-                        w.name, w.scope.len(),
+                    format!("已切换到工作空间 `{}`（权限 {} · LLM {} · 技能 {} 个）",
+                        w.name, w.permission_label(),
                         if w.llm_profile.is_empty() { "全局" } else { &w.llm_profile },
                         w.skills.len()),
                     v, start.elapsed().as_millis() as u64)
@@ -801,8 +794,6 @@ mod tests {
         let reg = WorkspaceRegistry::open(&root).unwrap();
         let w = reg.create(Workspace {
             name: "proj-a".into(),
-            scope: vec!["10.0.0.0/24".into()],
-            deny: vec!["10.0.0.1".into()],
             perms: WorkspacePerms { read: true, write: false, network: true, exec: false },
             llm_profile: "deepseek".into(),
             skills: vec!["recon-chain".into()],
@@ -811,10 +802,8 @@ mod tests {
             trees: vec![],
             note: "A 项目授权段".into(),
             created_at: 0, last_active: 0,
-            auto_approve: None,
-            restricted_token: None,
-            extra_scope: Vec::new(),
-            extra_deny: Vec::new(),
+            unrestricted: false,
+            sandbox_enabled: None,
         }).unwrap();
         assert_eq!(w.name, "proj-a");
         assert!(reg.workspace_dir("proj-a").join("data").is_dir());
@@ -984,56 +973,51 @@ mod tests {
     }
 
     #[test]
-    fn workspace_config_defaults_and_merge() {
+    fn permission_and_sandbox_semantics() {
+        // 默认：权限=默认全局（继承全局授权），沙箱跟随全局
         let w = Workspace::default();
-        assert_eq!(w.auto_approve, None);
-        assert_eq!(w.restricted_token, None);
-        assert!(w.extra_scope.is_empty());
-        assert!(w.extra_deny.is_empty());
-        // None = 跟随全局
-        assert!(w.approval(true));
-        assert!(!w.approval(false));
-        assert!(w.restricted(true));
-        assert!(!w.restricted(false));
-
+        assert_eq!(w.permission_label(), "global");
+        assert!(!w.auto_approve());
         let global_scope = vec!["10.0.0.0/24".to_string(), "example.com".to_string()];
         let global_deny = vec!["10.0.0.1".to_string()];
-        let w = Workspace {
-            extra_scope: vec!["example.com".to_string(), "192.168.1.0/24".to_string()],
-            extra_deny: vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()],
-            auto_approve: Some(false),
-            restricted_token: Some(true),
-            ..Default::default()
-        };
-        assert_eq!(
-            w.effective_scope(&global_scope),
-            vec!["10.0.0.0/24", "example.com", "192.168.1.0/24"]
-        );
-        assert_eq!(
-            w.effective_deny(&global_deny),
-            vec!["10.0.0.1", "10.0.0.2"]
-        );
-        // Some 覆盖全局（方向与全局相反）
-        assert!(!w.approval(true));
-        assert!(!w.approval(false));
-        assert!(w.restricted(false));
-        assert!(w.restricted(true));
+        assert_eq!(w.effective_scope(&global_scope), global_scope);
+        assert_eq!(w.effective_deny(&global_deny), global_deny);
+        assert!(w.effective_sandbox(true));
+        assert!(!w.effective_sandbox(false));
+        assert_eq!(w.sandbox_label(true), "on");
+        assert_eq!(w.sandbox_label(false), "off");
+
+        // 完全访问：通配一切 + 清空红线 + 自动跳过审批
+        let w = Workspace { unrestricted: true, ..Default::default() };
+        assert_eq!(w.permission_label(), "unrestricted");
+        assert!(w.auto_approve());
+        assert_eq!(w.effective_scope(&global_scope), vec!["*".to_string()]);
+        assert!(w.effective_deny(&global_deny).is_empty());
+
+        // 沙箱显式覆盖全局（两个方向都要能盖）
+        let on = Workspace { sandbox_enabled: Some(true), ..Default::default() };
+        let off = Workspace { sandbox_enabled: Some(false), ..Default::default() };
+        assert!(on.effective_sandbox(false));
+        assert!(!off.effective_sandbox(true));
     }
 
     #[test]
     fn workspace_config_fields_serde_default() {
-        // 旧 workspaces.toml 没有这 4 个字段，必须能反序列化且不丢原字段
+        // 旧 workspaces.toml 里的 scope/deny/auto_approve 等字段已被移除：
+        // serde 忽略未知字段，新字段取默认值，不影响反序列化。
         let old = r#"
 name = "legacy"
 scope = ["10.0.0.0/24"]
+deny = ["10.0.0.1"]
+auto_approve = true
+restricted_token = false
+extra_scope = ["example.com"]
+extra_deny = []
 "#;
         let w: Workspace = toml::from_str(old).unwrap();
         assert_eq!(w.name, "legacy");
-        assert_eq!(w.scope, vec!["10.0.0.0/24"]);
-        assert_eq!(w.auto_approve, None);
-        assert_eq!(w.restricted_token, None);
-        assert!(w.extra_scope.is_empty());
-        assert!(w.extra_deny.is_empty());
+        assert!(!w.unrestricted);
+        assert_eq!(w.sandbox_enabled, None);
     }
 
     // 手工构造 ExecutionContext（kern-core 无 Default，与 feat-nuclei/feat-tasks 同款）

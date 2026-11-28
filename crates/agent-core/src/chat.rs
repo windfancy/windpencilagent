@@ -355,6 +355,13 @@ impl ChatSession {
         self
     }
 
+    /// 审批模式短路：Some(true)=全部放行，Some(false)=全部拒绝，None=逐次询问。
+    /// 用于「允许完全访问」空间与自动化场景，避免逐次弹审批。
+    pub fn with_approval_mode(mut self, mode: Option<bool>) -> Self {
+        self.approval_mode = mode;
+        self
+    }
+
     /// 注入会话库（R5-3）：启用 /recall 旧会话召回，并开启逐轮落盘。
     pub fn with_sessions(mut self, store: Arc<base_store::SessionStore>) -> Self {
         self.sessions = Some(store);
@@ -2025,6 +2032,11 @@ pub fn targets_in_args(args: &Value) -> Vec<String> {
 ///
 /// 会话主链路与 CLI 直调（`/call`）共用这一份判定，避免"直调绕过范围校验"。
 pub fn scope_denial(scope: &[String], denylist: &[String], args: &Value) -> Option<String> {
+    // 完全访问模式：scope 显式含 `*` 时不做任何目标限制（拒绝清单也不再生效）。
+    // 这条规则只会由用户显式选择「允许完全访问」注入，空 scope 仍是 fail-closed。
+    if scope.iter().any(|s| s.trim() == "*") {
+        return None;
+    }
     let targets = targets_in_args(args);
     if targets.is_empty() {
         return None;
@@ -3265,6 +3277,18 @@ mod tests {
         let r = scope_denial(&mixed, &["10.0.0.0/XX".into()], &json!({"host": "10.0.0.5"}))
             .expect("应拒绝");
         assert!(r.contains("未通过授权校验"), "{r}");
+    }
+
+    #[test]
+    fn unrestricted_scope_bypasses_all_targets_and_denylist() {
+        // 「允许完全访问」= scope 显式含 `*`：任何目标、任何拒绝清单都放行
+        let scope: Vec<String> = vec!["*".into()];
+        let deny: Vec<String> = vec!["10.0.0.7".into(), ".gov.cn".into()];
+        assert!(scope_denial(&scope, &deny, &json!({"target": "10.0.0.7"})).is_none());
+        assert!(scope_denial(&scope, &deny, &json!({"host": "a.gov.cn"})).is_none());
+        assert!(scope_denial(&scope, &deny, &json!({"url": "https://any.example/x"})).is_none());
+        // 反向：空清单仍是 fail-closed，不能被误当成"完全访问"
+        assert!(scope_denial(&[], &[], &json!({"target": "10.0.0.5"})).is_some());
     }
 
     #[tokio::test]

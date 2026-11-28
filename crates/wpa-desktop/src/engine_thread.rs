@@ -105,13 +105,12 @@ pub enum Cmd {
     TaskAdd(String),
     TaskMove { id: String, col: i32 },
     TaskDelete(String),
-    /// #9 空间编辑保存（name, cwd, authorized 多行, whitelist 多行, approval 三态, sandbox 三态）
+    /// #9 空间编辑保存（name, cwd, whitelist 多行, permission: global/unrestricted, sandbox: on/off）
     SpaceSave {
         name: String,
         cwd: String,
-        authorized: String,
         whitelist: String,
-        approval: String,
+        permission: String,
         sandbox: String,
     },
     /// #9.1 会话管理（参数=空间过滤，空串=全部）
@@ -247,8 +246,7 @@ fn push_trace(
     };
     ui_set(window, move |app| {
         app.set_traces(ModelRc::new(VecModel::from(data)));
-        // 轨迹新增后自动滚到底部（viewport-y 超出范围由 Slint clamp）
-        app.set_trace_scroll_y(1e7);
+        // 自动滚屏由 Slint 侧哨兵 + ensure-visible 完成（见 RightRail）
     });
 }
 
@@ -271,8 +269,7 @@ fn push_msg(
     };
     ui_set(window, move |app| {
         app.set_messages(ModelRc::new(VecModel::from(data)));
-        // 新消息到达后自动滚到底部（用户手动上翻只在下次新消息时被拉回，符合聊天习惯）
-        app.set_chat_scroll_y(1e7);
+        // 自动滚屏由 Slint 侧哨兵 + ensure-visible 完成（见 ChatPage）
     });
 }
 
@@ -508,13 +505,11 @@ fn apply_snapshot(base: &Base, window: &slint::Weak<AppWindow>) {
         .map(|s| SpaceRow {
             name: s.name.clone().into(),
             active: s.active,
-            scope: s.scope as i32,
             plugins: s.plugins as i32,
             note: s.note.clone().into(),
             cwd: s.cwd.clone().into(),
-            authorized: s.authorized.join("\n").into(),
             whitelist: s.whitelist.join("\n").into(),
-            approval: s.approval.clone().into(),
+            permission: s.permission.clone().into(),
             sandbox: s.sandbox.clone().into(),
         })
         .collect();
@@ -1032,13 +1027,14 @@ impl Engine {
         // 审批回调：同步阻塞等 UI 裁决
         let ap_slot = self.approval.clone();
         let ap_window = window.clone();
-        // 空间级审批覆盖（#14）：空间设了 auto_approve 就盖掉全局，否则跟随全局
+        // 空间级审批覆盖（#14）：完全访问空间或全局自动批准 → 直接放行
         let auto = self
             .base
             .workspaces
             .active()
-            .map(|w| w.approval(self.cfg.run.auto_approve))
-            .unwrap_or(self.cfg.run.auto_approve);
+            .map(|w| w.auto_approve())
+            .unwrap_or(false)
+            || self.cfg.run.auto_approve;
         let timeout = self.cfg.run.approval_timeout_secs.unwrap_or(300);
         let approval: agent_core::ApprovalCallback =
             Arc::new(move |tool: &str, risk: RiskLevel, args: &str| -> bool {
@@ -1079,8 +1075,9 @@ impl Engine {
                 .base
                 .workspaces
                 .active()
-                .map(|w| w.approval(self.cfg.run.auto_approve))
-                .unwrap_or(self.cfg.run.auto_approve),
+                .map(|w| w.auto_approve())
+                .unwrap_or(false)
+                || self.cfg.run.auto_approve,
         };
         let (mut session, info) = build_session(&self.base, opts);
         // 会话归属：落盘时写入 SessionRecord，会话列表据此按空间分类
@@ -1601,33 +1598,19 @@ impl Engine {
                     toast(&self.window, "未能从参数中识别出目标，请手动加入授权范围");
                     return;
                 }
-                let Some(name) = self.base.workspaces.active().map(|w| w.name.clone()) else {
-                    // 全局空间无空间配置，写全局 [scope] authorized
+                // 空间不再有独立授权目标：无论当前是否有活跃空间，一律写全局 [scope] authorized。
+                if !self.cfg.scope.authorized.contains(&target) {
                     self.cfg.scope.authorized.push(target.clone());
-                    match self.cfg.commit(&self.cfg_path, &[ConfigSection::Scope]) {
-                        Ok(_) => {
-                            self.sync_base_cfg();
-                            self.session = None;
-                            self.ensure_session();
-                            toast(&self.window, format!("目标 {target} 已加入全局授权白名单"));
-                        }
-                        Err(e) => toast(&self.window, format!("加入授权白名单失败：{e}")),
-                    }
-                    return;
-                };
-                let Some(mut w) = self.base.workspaces.get(&name) else { return };
-                if !w.scope.contains(&target) {
-                    w.scope.push(target.clone());
                 }
-                match self.base.workspaces.update(w) {
-                    Ok(()) => {
+                match self.cfg.commit(&self.cfg_path, &[ConfigSection::Scope]) {
+                    Ok(_) => {
                         self.sync_base_cfg();
                         self.session = None;
                         self.ensure_session();
                         apply_snapshot(&self.base, &self.window);
-                        toast(&self.window, format!("目标 {target} 已加入空间「{name}」授权白名单"));
+                        toast(&self.window, format!("目标 {target} 已加入全局授权白名单"));
                     }
-                    Err(e) => toast(&self.window, format!("加入空间白名单失败：{e}")),
+                    Err(e) => toast(&self.window, format!("加入授权白名单失败：{e}")),
                 }
             }
             Cmd::SwitchDomain(id) => {
@@ -2152,23 +2135,20 @@ impl Engine {
             }
 
             // #9 空间编辑保存
-            Cmd::SpaceSave { name, cwd, authorized, whitelist, approval, sandbox } => {
+            Cmd::SpaceSave { name, cwd, whitelist, permission, sandbox } => {
                 let Some(mut w) = self.base.workspaces.get(&name) else {
                     toast(&self.window, format!("空间 {name} 不存在"));
                     return;
                 };
                 w.cwd = cwd.trim().to_string();
-                w.scope = authorized.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
                 w.plugins = whitelist.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
-                w.auto_approve = match approval.as_str() {
-                    "auto" => Some(true), "ask" => Some(false), _ => None,
-                };
-                w.restricted_token = match sandbox.as_str() {
-                    "strict" => Some(true), "relaxed" => Some(false), _ => None,
-                };
+                // 权限二值：unrestricted = 允许完全访问；其余 = 默认全局
+                w.unrestricted = permission == "unrestricted";
+                // 沙箱二值：on / off（UI 只有两项）
+                w.sandbox_enabled = Some(sandbox == "on");
                 match self.base.workspaces.update(w) {
                     Ok(()) => {
-                        // 空间级策略改了要重建会话（授权/审批在会话构建时生效）
+                        // 空间级策略改了要重建会话（授权/审批/沙箱在会话构建时生效）
                         self.session = None;
                         self.ensure_session();
                         apply_snapshot(&self.base, &self.window);
@@ -2292,8 +2272,6 @@ impl Engine {
                     ui_set(&w, move |app| {
                         app.set_messages(ModelRc::new(VecModel::from(msgs)));
                         app.set_traces(ModelRc::new(VecModel::from(Vec::<TraceRow>::new())));
-                        app.set_chat_scroll_y(1e7);
-                        app.set_trace_scroll_y(0.0);
                     });
                 }
                 if let Some(info) = self.info.clone() {

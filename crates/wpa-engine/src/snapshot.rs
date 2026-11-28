@@ -21,17 +21,13 @@ pub struct ToolRow {
 pub struct SpaceRow {
     pub name: String,
     pub active: bool,
-    /// 授权目标条数
-    pub scope: usize,
     pub cwd: String,
     pub trees: Vec<String>,
-    /// 授权目标明细（空间页可编辑）
-    pub authorized: Vec<String>,
     /// 工具白名单明细（组 id / 工具名）
     pub whitelist: Vec<String>,
-    /// 审批三态：global / auto / ask
-    pub approval: String,
-    /// 沙箱三态：global / strict / relaxed
+    /// 权限模式：global（默认继承全局）/ unrestricted（允许完全访问）
+    pub permission: String,
+    /// 沙箱：on / off（未显式设置时按全局归一）
     pub sandbox: String,
     /// 工具白名单条数（0 = 全部）
     pub plugins: usize,

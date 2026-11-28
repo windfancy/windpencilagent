@@ -11,6 +11,38 @@ use kern_core::model::ExecutionContext;
 
 use crate::encoding::decode_output;
 
+/// 空间级沙箱覆盖：-1 = 跟随全局，0 = 强制关闭，1 = 强制启用。
+///
+/// 工具在装配期无法预知之后会切到哪个空间，所以把"当前空间的选择"放在
+/// 进程级标记里，由每次装配会话时写入、执行时读取。
+static SPACE_SANDBOX: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// 写入当前空间的沙箱选择（None = 跟随全局）。
+pub fn set_space_sandbox(v: Option<bool>) {
+    SPACE_SANDBOX.store(
+        match v {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// 读取当前空间的沙箱覆盖（None = 未覆盖，沿用全局默认）。
+pub fn space_sandbox() -> Option<bool> {
+    match SPACE_SANDBOX.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(true),
+        0 => Some(false),
+        _ => None,
+    }
+}
+
+/// 计算实际生效的受限令牌开关：空间覆盖优先，否则用工具自身的全局默认。
+pub fn effective_restricted(global_default: bool) -> bool {
+    space_sandbox().unwrap_or(global_default)
+}
+
 /// R4-5（dsh X6 凭据洗涤）：环境变量名是否疑似凭据（KEY/PASSWORD/SECRET/TOKEN/
 /// CREDENTIAL 形命名，大小写不敏感）。
 pub fn is_credential_var(name: &str) -> bool {

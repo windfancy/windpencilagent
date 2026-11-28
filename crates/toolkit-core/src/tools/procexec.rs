@@ -118,7 +118,8 @@ impl Tool for ProcExec {
 
         let cfg = SandboxConfig {
             max_exec_ms: timeout_secs * 1000,
-            restricted: self.default_cfg.restricted,
+            // 空间「沙箱启用/关闭」优先，否则用装配期的全局默认。
+            restricted: crate::sandbox::effective_restricted(self.default_cfg.restricted),
             ..SandboxConfig::default()
         };
         let sandbox = Sandbox::new(cfg);

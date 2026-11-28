@@ -30,6 +30,25 @@ pub struct RiskRules {
 
 static RULES: RwLock<Option<Arc<RiskRules>>> = RwLock::new(None);
 
+/// 基座内置的良性程序清单：**只读 / 探测**语义，不含任何写操作、不含解释器。
+///
+/// 装配期默认注入。目的：授权之后，`nmap -V`、`curl -I`、`ping` 这类只读探测
+/// 不应因为"未知程序一律 High"再撞上 `min_risk=high` 的知识约束而被拦。
+/// 真正的破坏性命令仍由 [`DESTRUCTIVE_PATTERNS`] 判 High（白名单不放宽红线）。
+pub const BUILTIN_BENIGN: &[&str] = &[
+    "nmap", "masscan", "ping", "tracert", "traceroute", "nslookup", "dig", "host",
+    "whois", "curl", "wget", "openssl", "ipconfig", "ifconfig", "arp", "route",
+    "netstat", "tasklist", "systeminfo", "whoami", "dir", "ls", "cat", "type",
+];
+
+/// 基座内置规则（装配期直接注入；可由领域包用 [`install_rules`] 覆盖）。
+pub fn builtin_rules() -> RiskRules {
+    RiskRules {
+        benign_programs: BUILTIN_BENIGN.iter().map(|s| (*s).to_string()).collect(),
+        extra_danger_patterns: Vec::new(),
+    }
+}
+
 /// 注入业务风险规则（逻辑群组装配期调用；重复调用以后者为准）。
 pub fn install_rules(rules: RiskRules) {
     if let Ok(mut slot) = RULES.write() {
@@ -195,8 +214,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_program_is_high() {
+    fn builtin_rules_allow_readonly_recon_but_keep_redlines() {
         let _g = TEST_LOCK.lock().unwrap();
+        install_rules(builtin_rules());
+        // 只读探测：授权后应免审（不再被 min_risk=high 的知识约束误拦）
+        assert_eq!(classify_argv("nmap", &["-V"]), RiskLevel::Medium);
+        assert_eq!(classify_command_line("nmap -sV 192.168.1.16"), RiskLevel::Medium);
+        assert_eq!(classify_command_line("curl -I http://x"), RiskLevel::Medium);
+        // 红线不放宽：白名单程序 + 破坏性参数仍是 High
+        assert_eq!(classify_command_line("nmap && format C:"), RiskLevel::High);
+        assert_eq!(classify_argv("powershell", &["-enc", "x"]), RiskLevel::High);
+        clear_rules();
+    }
+
+    #[test]
+    fn unknown_program_is_high() {        let _g = TEST_LOCK.lock().unwrap();
         with_rules(&["nmap"]);
         assert_eq!(classify_argv("python", &["-c", "1"]), RiskLevel::High);
         assert_eq!(classify_command_line("powershell Get-Process"), RiskLevel::High);

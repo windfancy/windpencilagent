@@ -211,6 +211,10 @@ pub async fn assemble(cfg: &AppConfig, _cli_tree: Option<PathBuf>) -> anyhow::Re
     // 留空时不设置，由 pysandbox 回退到"程序子目录自动探测"。
     // 用 set_var 是进程级的，但装配只在启动/会话边界发生，且值来自同一份配置。
     apply_python_settings(cfg);
+    // 风险规则注入：基座内置"只读探测"白名单。
+    // 不注入的话所有命令都判 High，再撞上知识约束的 min_risk=high 规则——
+    // 结果就是"授权了仍被拦"（用户实测的核心问题）。
+    toolkit_core::risk_policy::install_rules(toolkit_core::risk_policy::builtin_rules());
     let workspaces = Arc::new(
         WorkspaceRegistry::open(cfg.workspaces_root())
             .map_err(|e| anyhow::anyhow!("打开空间注册表失败：{e}"))?,
@@ -605,33 +609,29 @@ pub fn build_session(base: &Base, opts: SessionOpts) -> (ChatSession, SessionInf
     let active: Option<Workspace> = base.workspaces.active();
     let space_name = active.as_ref().map(|w| w.name.clone()).unwrap_or_default();
 
-    // 2) 授权范围：CLI > 空间(可覆盖全局) > 配置
-    //    空间可覆盖全局（用户拍板）：空间 scope 非空就用它，否则回落全局；
-    //    无论哪种，再叠加空间的 extra_scope（追加授权目标）。
+    // 2) 授权范围：CLI > 空间权限模式 > 配置
+    //    空间权限只有两档：
+    //      - 默认全局：直接继承全局授权/红线（空间不再有自己的授权目标）
+    //      - 允许完全访问：授权通配一切（`*`）+ 清空红线 + 跳过约束钩子与审批
+    //    注意空清单是 fail-closed，完全访问必须靠显式 `*` 规则表达。
     let cli_targets = &opts.targets;
-    let scope = if !cli_targets.is_empty() {
-        cli_targets.clone()
+    let unrestricted = active.as_ref().map(|w| w.unrestricted).unwrap_or(false);
+    let (scope, deny) = if !cli_targets.is_empty() {
+        (cli_targets.clone(), base.denylist.as_ref().clone())
     } else if let Some(w) = active.as_ref() {
-        let base_scope = if w.scope.is_empty() {
-            cfg.scope.authorized.clone()
-        } else {
-            w.scope.clone()
-        };
-        w.effective_scope(&base_scope)
+        (
+            w.effective_scope(&cfg.scope.authorized),
+            w.effective_deny(&base.denylist),
+        )
     } else {
-        cfg.scope.authorized.clone()
+        (cfg.scope.authorized.clone(), base.denylist.as_ref().clone())
     };
 
-    // 3) 拒绝清单：配置 + 空间（并集，只能更严）
-    //    空间的 deny 与 extra_deny 都并入——红线永远只叠加、不放宽。
-    let mut deny: Vec<String> = base.denylist.as_ref().clone();
-    if let Some(w) = &active {
-        for d in w.effective_deny(&w.deny) {
-            if !deny.contains(&d) {
-                deny.push(d);
-            }
-        }
-    }
+    // 2.5) 沙箱开关随空间生效：None = 工具沿用全局默认，Some = 强制覆盖。
+    //      工具在执行时读取该全局标记（装配期无法预知之后切到哪个空间）。
+    toolkit_core::sandbox::set_space_sandbox(
+        active.as_ref().and_then(|w| w.sandbox_enabled),
+    );
 
     // 3.5) 授权范围自检：写错的条目在装配期就报出来，不用等调工具时才发现。
     // 解析规则与执行层完全一致（ScopeGuard::from_lists_lenient），避免两处口径不同。
@@ -1005,9 +1005,14 @@ pub fn build_session(base: &Base, opts: SessionOpts) -> (ChatSession, SessionInf
     if let Some(store) = base.sessions.clone() {
         session = session.with_sessions(store);
     }
-    // 知识约束钩子（S-5）：denylist 之后、审批之前裁决；只可能更严，不会更松
-    if !base.constraints.rules().is_empty() {
+    // 知识约束钩子（S-5）：denylist 之后、审批之前裁决；只可能更严，不会更松。
+    // 完全访问模式下不装钩子——用户显式选择了"解除全部限制"，红线一并放开。
+    if !unrestricted && !base.constraints.rules().is_empty() {
         session = session.with_hook(Arc::new(ConstraintHook::new(base.constraints.clone())));
+    }
+    // 审批短路：完全访问或自动化场景（auto_approve）一次性全部放行，不再逐次询问。
+    if unrestricted || opts.auto_approve {
+        session = session.with_approval_mode(Some(true));
     }
     if let Some(w) = &active {
         if !w.cwd.trim().is_empty() {
@@ -1106,27 +1111,18 @@ impl Base {
             .collect();
 
         let active = self.workspaces.active_name().unwrap_or_default();
+        let global_sandbox = self.cfg.sandbox.restricted_token;
         let spaces: Vec<SpaceRow> = self
             .workspaces
             .list()
             .into_iter()
             .map(|w| SpaceRow {
                 active: w.name == active,
-                scope: w.scope.len(),
                 cwd: w.cwd.clone(),
                 trees: w.trees.clone(),
-                authorized: w.scope.clone(),
                 whitelist: w.plugins.clone(),
-                approval: match w.auto_approve {
-                    Some(true) => "auto".to_string(),
-                    Some(false) => "ask".to_string(),
-                    None => "global".to_string(),
-                },
-                sandbox: match w.restricted_token {
-                    Some(true) => "strict".to_string(),
-                    Some(false) => "relaxed".to_string(),
-                    None => "global".to_string(),
-                },
+                permission: w.permission_label().to_string(),
+                sandbox: w.sandbox_label(global_sandbox).to_string(),
                 plugins: w.plugins.len(),
                 skills: w.skills.len(),
                 note: w.note.clone(),

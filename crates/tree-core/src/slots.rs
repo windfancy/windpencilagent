@@ -19,12 +19,37 @@ pub struct SlotContext {
     pub session_id: String,
 }
 
+/// 从一条授权范围条目推导出一个**具体主机**：CIDR 取网段内第一个可用主机，
+/// 单 IP / 域名 / 主机名原样返回；`*`（完全访问）与无法推导的 IPv6 CIDR 返回 None
+/// （没有"具体目标"可填，宁可缺参也不猜）。
+fn scope_host(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "*" {
+        return None;
+    }
+    if let Some((ip, prefix)) = raw.split_once('/') {
+        let net = ip.trim().parse::<std::net::Ipv4Addr>().ok()?;
+        let prefix = prefix.trim().parse::<u8>().ok()?;
+        if prefix > 32 {
+            return None;
+        }
+        let base = u32::from(net);
+        // /31、/32 没有"网络地址"概念，直接用；其余 +1 跳过网络地址。
+        let host = if prefix >= 31 { base } else { base.saturating_add(1) };
+        return Some(std::net::Ipv4Addr::from(host).to_string());
+    }
+    Some(raw.to_string())
+}
+
 impl SlotContext {
     /// 解析一个插槽表达式。未知来源返回 `None`（fail-closed：宁可缺参也不猜）。
     pub fn resolve(&self, expr: &str) -> Option<Value> {
         let expr = expr.trim();
         match expr {
-            "scope.primary" => self.scope.first().map(|s| Value::String(s.clone())),
+            // `scope.primary` 要填的是"一个具体主机"，而不是授权范围原文。
+            // 若第一个授权项是 CIDR（如 192.168.1.0/24），直接把它当 host 传给工具会
+            // 让下游把 CIDR 当 IP 解析失败、误判未授权——这里取网段内第一个可用主机。
+            "scope.primary" => self.scope.first().and_then(|s| scope_host(s)).map(Value::String),
             "scope.all" => Some(Value::Array(
                 self.scope.iter().cloned().map(Value::String).collect(),
             )),
@@ -127,6 +152,22 @@ mod tests {
         let empty = SlotContext::default();
         assert!(!empty.has_scope());
         assert_eq!(empty.resolve("workspace.cwd"), None);
+    }
+
+    #[test]
+    fn scope_primary_derives_host_from_cidr() {
+        // CIDR 授权项不能再把原文当 host 传给工具（下游会把 /24 当 IP 解析失败）
+        let c = SlotContext {
+            scope: vec!["192.168.1.0/24".into()],
+            ..Default::default()
+        };
+        assert_eq!(c.resolve("scope.primary"), Some(json!("192.168.1.1")));
+        // /32 直接取该地址
+        let c32 = SlotContext { scope: vec!["10.0.0.7/32".into()], ..Default::default() };
+        assert_eq!(c32.resolve("scope.primary"), Some(json!("10.0.0.7")));
+        // 完全访问（*）没有具体目标可填
+        let star = SlotContext { scope: vec!["*".into()], ..Default::default() };
+        assert_eq!(star.resolve("scope.primary"), None);
     }
 
     #[test]
