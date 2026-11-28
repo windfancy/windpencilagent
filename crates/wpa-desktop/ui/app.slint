@@ -2982,11 +2982,22 @@ component AbilityPage inherits Rectangle {
     in property <bool> sel-installable: false;
     in property <bool> sel-enabled: false;
 
+    /// 插件目录绝对路径（"往哪放 dll"要显性，不能让用户猜）
+    in property <string> plugins-root: "";
+    /// 上次「扫描发现」的结论：常驻卡片，不随 4 秒 toast 消失
+    in property <string> scan-note: "";
+    /// 上次扫描的逐条问题（装配报告区展示；摘要放卡片）
+    in property <string> scan-detail: "";
+
     callback pick-entry(string);
     /// (id, op)：op ∈ enable / disable / install / uninstall / group-on / group-off /
     ///   assign:<组id> / group-add:<名> / group-rename:<名> / group-remove / group-desc:<描述>
     callback op(string, string);
     callback pick-path(string, bool);
+    /// 主动扫描发现（自举 → 扫描 → 对账 → 落盘 → 重新装配）
+    callback scan-plugins();
+    /// 在资源管理器里打开插件目录
+    callback open-plugins-dir();
 
     in-out property <string> cur-group: "";
     in-out property <string> cur-entry: "";
@@ -3087,9 +3098,9 @@ component AbilityPage inherits Rectangle {
                         }
                     }
                 }
-                // 组管理（#5）：新建 / 改名 / 删除 / 描述
+                // 组管理（#5）：新建 / 改名 / 删除 / 描述 + 主动扫描发现
                 Rectangle {
-                    height: 116px;
+                    height: 188px;
                     border-radius: 6px;
                     background: Theme.palette.surface_raised;
                     VerticalLayout {
@@ -3116,6 +3127,42 @@ component AbilityPage inherits Rectangle {
                             height: 26px;
                             edited(t) => { root.group-desc-edit = t; }
                             accepted(t) => { root.op(root.cur-group, "group-desc:" + t); }
+                        }
+                        // 主动扫描发现：把"放文件 → 发现"做成一个按钮，
+                        // 不再需要重启程序或去命令行敲 registry list。
+                        Rectangle { height: 1px; background: Theme.palette.border; }
+                        HorizontalLayout { spacing: 4px;
+                            Button {
+                                text: "扫描插件";
+                                height: 26px;
+                                horizontal-stretch: 1;
+                                clicked => { root.scan-plugins(); }
+                            }
+                            Button {
+                                text: "打开目录";
+                                height: 26px;
+                                width: 64px;
+                                outlined: true;
+                                clicked => { root.open-plugins-dir(); }
+                            }
+                        }
+                        Text {
+                            text: root.plugins-root;
+                            color: Theme.palette.text_disabled;
+                            font-size: 10px;
+                            height: 13px;
+                            overflow: elide;
+                        }
+                        // 上次扫描结论：toast 4 秒就收，结论必须留在界面上
+                        Text {
+                            text: root.scan-note == ""
+                                  ? "把 dll 或组目录放进上面的目录，点「扫描插件」即发现（无需重启）"
+                                  : root.scan-note;
+                            color: root.scan-note == "" ? Theme.palette.text_disabled : Theme.palette.text_secondary;
+                            font-size: 10px;
+                            height: 30px;
+                            wrap: word-wrap;
+                            overflow: clip;
                         }
                     }
                 }
@@ -3382,8 +3429,26 @@ component AbilityPage inherits Rectangle {
                     wrap: word-wrap;
                 }
                 Text {
-                    text: "缺文件 / 未安装的条目不会进工具面；装好并启用后需要重新装配才生效。";
+                    text: "缺文件 / 未安装的条目不会进工具面；补齐文件后点左栏「扫描插件」重新发现即可。";
                     color: Theme.palette.text_disabled;
+                    font-size: 10px;
+                    wrap: word-wrap;
+                }
+                // 上次扫描的逐条问题：toast 只放摘要，诊断细节留在这里
+                if root.scan-detail != "" : Rectangle {
+                    height: 1px;
+                    background: Theme.palette.border;
+                }
+                if root.scan-detail != "" : Text {
+                    text: "上次扫描";
+                    color: Theme.palette.text_disabled;
+                    font-size: 11px;
+                    height: 18px;
+                    vertical-alignment: center;
+                }
+                if root.scan-detail != "" : Text {
+                    text: root.scan-detail;
+                    color: Theme.palette.text_secondary;
                     font-size: 10px;
                     wrap: word-wrap;
                 }
@@ -3484,6 +3549,10 @@ export component AppWindow inherits Window {
     in-out property <bool> ab-installed: false;
     in-out property <bool> ab-installable: false;
     in-out property <bool> ab-enabled: false;
+    // 「扫描发现」：插件目录路径 / 上次结论 / 上次问题明细（Rust 下发）
+    in-out property <string> plugins-root: "";
+    in-out property <string> ab-scan-note: "";
+    in-out property <string> ab-scan-detail: "";
     // 对话页状态条
     in-out property <string> domain-name: "";
     in-out property <int> ctx-used: 0;
@@ -3596,6 +3665,9 @@ export component AppWindow inherits Window {
     callback ability-pick(string);
     // 能力页注册表操作：(id, op) —— op ∈ enable/disable/install/uninstall/group-on/group-off/assign:/group-add:/group-rename:/group-remove:/group-desc:
     callback reg-op(string, string);
+    // 主动扫描发现 / 打开插件目录（组管理里的两个按钮）
+    callback scan-plugins();
+    callback open-plugins-dir();
     callback refresh();
 
     // ---- 本轮 20 条改动新增回调 ----
@@ -3895,8 +3967,13 @@ export component AppWindow inherits Window {
                         sel-installed: root.ab-installed;
                         sel-installable: root.ab-installable;
                         sel-enabled: root.ab-enabled;
+                        plugins-root: root.plugins-root;
+                        scan-note: root.ab-scan-note;
+                        scan-detail: root.ab-scan-detail;
                         pick-entry(n) => { root.ability-pick(n); }
                         op(id, what) => { root.reg-op(id, what); }
+                        scan-plugins => { root.scan-plugins(); }
+                        open-plugins-dir => { root.open-plugins-dir(); }
                     }
                     MemoryPage {
                         visible: root.page == 4;

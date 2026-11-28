@@ -326,6 +326,20 @@ fn run_inner(config_path: PathBuf) -> anyhow::Result<()> {
             let _ = h.send(Cmd::ReloadTree);
         });
     }
+    // 组管理：主动扫描发现（自举 → 扫描 → 对账 → 落盘 → 重新装配）
+    {
+        let h = handle.tx.clone();
+        app.on_scan_plugins(move || {
+            let _ = h.send(Cmd::ScanPlugins);
+        });
+    }
+    // 组管理：在资源管理器里打开插件目录
+    {
+        let h = handle.tx.clone();
+        app.on_open_plugins_dir(move || {
+            let _ = h.send(Cmd::OpenPluginsDir);
+        });
+    }
 
     // ---- 本轮 20 条改动新增回调 ----
     // 对话页：选择器 + 复制

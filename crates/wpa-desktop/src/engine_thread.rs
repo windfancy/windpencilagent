@@ -42,6 +42,11 @@ pub enum Cmd {
     /// 树包启停（写注册表；装配在下次启动生效）
     /// 重新装配（T-6 热装换：会话边界重读树注册表与清单）
     ReloadTree,
+    /// 主动扫描发现：自举收编裸 dll → 扫描 plugins/ → 对账 → 落盘 → 重新装配。
+    /// 全部在本进程内完成，不需要 CLI，也不需要重启。
+    ScanPlugins,
+    /// 在工作区打开插件目录（「放 dll → 扫描」闭环，省得用户手敲路径）
+    OpenPluginsDir,
     OpenConfig,
     SetTheme(bool),
     SetFont(u32),
@@ -226,6 +231,17 @@ fn toast(window: &slint::Weak<AppWindow>, text: impl Into<String>) {
 
 fn set_busy(window: &slint::Weak<AppWindow>, busy: bool) {
     ui_set(window, move |app| app.set_busy(busy));
+}
+
+/// 在系统文件管理器里打开一个目录（工作区根 / 插件目录共用）。
+fn open_in_explorer(dir: &std::path::Path, window: &slint::Weak<AppWindow>) {
+    #[cfg(windows)]
+    let spawned = std::process::Command::new("explorer").arg(dir).spawn();
+    #[cfg(not(windows))]
+    let spawned = std::process::Command::new("xdg-open").arg(dir).spawn();
+    if let Err(e) = spawned {
+        toast(window, format!("打开目录失败：{e}"));
+    }
 }
 
 fn push_trace(
@@ -592,6 +608,7 @@ fn apply_snapshot(base: &Base, window: &slint::Weak<AppWindow>) {
     let scope_text = snap.scope_rules.join("\n");
     // 卡片模型含 ModelRc（单线程类型），只能在 UI 线程内构建 ⇒ 把配置快照搬进闭包
     let cfg_for_cards = base.cfg.clone();
+    let cfg_plugins_root = base.cfg.plugins_root().display().to_string();
     let domain_name = snap.domain.clone();
     let model_names: Vec<slint::SharedString> = base
         .models()
@@ -713,6 +730,8 @@ fn apply_snapshot(base: &Base, window: &slint::Weak<AppWindow>) {
         app.set_reg_groups(ModelRc::new(VecModel::from(reg_groups)));
         app.set_reg_entries(ModelRc::new(VecModel::from(reg_entries)));
         app.set_reg_summary(snap.reg_summary.as_str().into());
+        // 插件目录：组管理卡片里显示"往哪放 dll"，省得用户去翻配置
+        app.set_plugins_root(cfg_plugins_root.as_str().into());
         // 空间行含 ModelRc（文件列表，!Send），只能在 UI 线程里构建
         let spaces: Vec<SpaceRow> = snap
             .spaces
@@ -921,13 +940,16 @@ impl Engine {
     ///
     /// 为什么不在会话中途换：工具面、约束钩子、阶段状态都挂在会话上，
     /// 中途替换会让"上一轮用过的工具这一轮消失"，行为不可复盘。换会话才是干净的边界。
-    fn reload_tree(&mut self) {
+    ///
+    /// 返回是否装成功：调用方（如「扫描发现」）要把失败并进自己的汇报里，
+    /// 否则用户只看到"已扫描"，不知道改动要等下次启动才生效。
+    fn reload_tree(&mut self) -> bool {
         // 1) 先装配新的：失败则原样保留（绝不让用户落到"基座已关、树没装上"的死状态）
         let new_base = match self.rt.block_on(assemble(&self.cfg, None)) {
             Ok(b) => b,
             Err(e) => {
                 toast(&self.window, format!("重新装配失败（保持原状）：{e}"));
-                return;
+                return false;
             }
         };
         // 2) 丢旧会话（释放对旧注册表的引用）→ 关旧基座 → 换新
@@ -940,6 +962,7 @@ impl Engine {
         self.ensure_session();
         apply_snapshot(&self.base, &self.window);
         toast(&self.window, format!("已重新装配：{} 个工具", self.base.snapshot().tool_count));
+        true
     }
 
     fn apply_info(&self, info: &SessionInfo) {
@@ -1484,7 +1507,84 @@ impl Engine {
                     Err(e) => toast(&self.window, format!("保存失败：{e}")),
                 }
             }
-            Cmd::ReloadTree => self.reload_tree(),
+            Cmd::ReloadTree => {
+                self.reload_tree();
+            }
+            // 主动扫描发现（组管理里的按钮）：全部在本进程内，不需要 CLI / 重启。
+            Cmd::ScanPlugins => {
+                // 裸 dll 探测是子进程 + 5s 超时，慢是可能的：置忙既防连点，也让用户知道在跑
+                set_busy(&self.window, true);
+                let root = self.base.cfg.plugins_root();
+                // 目录都不在：报"0 组"等于没说，直接把下一步指出来
+                if !root.is_dir() {
+                    let msg = format!(
+                        "插件目录不存在：{}（点「打开目录」会建好，再放 dll）",
+                        root.display()
+                    );
+                    let m = msg.clone();
+                    ui_set(&self.window, move |app| {
+                        app.set_ab_scan_note(m.into());
+                        app.set_ab_scan_detail("".into());
+                    });
+                    toast(&self.window, msg);
+                    set_busy(&self.window, false);
+                    return;
+                }
+                let auto_probe = self.cfg.plugins.auto_probe;
+                let path = wpa_engine::registry::registry_path(&self.cfg.data_root());
+                let (rep, save_err) = {
+                    let mut reg = self
+                        .base
+                        .registry
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let rep = wpa_engine::registry::discover(&root, auto_probe, &mut reg);
+                    let err = reg.save(&path).err();
+                    (rep, err)
+                };
+                // 详情进日志：卡片只放摘要，问题清单不该只活在会消失的 toast 里
+                for line in rep.detail().lines() {
+                    tracing::info!("扫描发现：{line}");
+                }
+                // 候选与工具面只有重新装配才刷新（能力页的"未安装"取自宿主扫描报告）
+                let rebuilt = self.reload_tree();
+                let mut note = rep.describe();
+                if let Some(e) = &save_err {
+                    note = format!("{note}；但账本保存失败：{e}");
+                }
+                if !rebuilt {
+                    note = format!("{note}；重新装配失败，改动下次启动生效");
+                }
+                // toast 只有 56px 高：正常走精简句，出错时宁可长一点也不能吞掉原因
+                let mut brief = format!("扫描完成：{} 组 / {} 条", rep.groups, rep.entries);
+                if !rep.new_groups.is_empty() || rep.new_entries > 0 {
+                    brief = format!(
+                        "{brief} · 新组 {} / 新条目 {}",
+                        rep.new_groups.len(),
+                        rep.new_entries
+                    );
+                }
+                if save_err.is_some() || !rebuilt {
+                    brief = note.clone();
+                }
+                // 卡片里留一条不会自己消失的结论（toast 4 秒就收了）
+                let detail = rep.detail();
+                ui_set(&self.window, move |app| {
+                    app.set_ab_scan_note(note.into());
+                    app.set_ab_scan_detail(detail.into());
+                });
+                toast(&self.window, brief);
+                set_busy(&self.window, false);
+            }
+            // 「放 dll → 扫描」闭环：不用用户自己找插件目录在哪
+            Cmd::OpenPluginsDir => {
+                let root = self.base.cfg.plugins_root();
+                if let Err(e) = std::fs::create_dir_all(&root) {
+                    toast(&self.window, format!("打开插件目录失败：{e}"));
+                    return;
+                }
+                open_in_explorer(&root, &self.window);
+            }
             Cmd::SetField { key, value } => {
                 let old_theme = self.cfg.app.theme.clone();
                 let old_font = self.cfg.app.font_size;
@@ -2188,13 +2288,7 @@ impl Engine {
                     toast(&self.window, format!("打开目录失败：{e}"));
                     return;
                 }
-                #[cfg(windows)]
-                let spawned = std::process::Command::new("explorer").arg(&root).spawn();
-                #[cfg(not(windows))]
-                let spawned = std::process::Command::new("xdg-open").arg(&root).spawn();
-                if let Err(e) = spawned {
-                    toast(&self.window, format!("打开目录失败：{e}"));
-                }
+                open_in_explorer(&root, &self.window);
             }
 
             // 初始化工作区骨架（scripts/、output/、AGENTS.md、空间记忆）

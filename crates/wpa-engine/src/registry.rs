@@ -1046,6 +1046,146 @@ pub fn snapshot_from_groups(groups: &[plugin_host::GroupEntry]) -> ScanSnapshot 
     out
 }
 
+/// 一次「主动扫描发现」的结果（GUI 的「扫描发现」按钮与启动日志共用）。
+#[derive(Debug, Clone, Default)]
+pub struct DiscoverReport {
+    /// 裸 dll 收编 + 挂起搬迁补做的结果。
+    pub adopt: plugin_host::AdoptReport,
+    /// 注册表对账结果（缺文件 / 恢复计数）。
+    pub merge: MergeReport,
+    /// 扫描期问题（清单解析失败、目录名与 id 不符等）。
+    pub problems: Vec<String>,
+    /// 本次扫到的组数（磁盘事实，不是账本）。
+    pub groups: usize,
+    /// 本次扫到的条目数（磁盘事实，不是账本）。
+    pub entries: usize,
+    /// 磁盘上有、账本里没有的组 id（**只报告不落库**——装不装是人的决定）。
+    pub new_groups: Vec<String>,
+    /// 磁盘上有、账本里没有的条目数。
+    pub new_entries: usize,
+    /// 根目录下「放进去却扫不到」的目录名（缺 `PnC.toml` 或清单坏了）。
+    /// 扫描对这类目录是静默跳过的，用户看到的是"点了没反应"——这里点名。
+    pub skipped: Vec<String>,
+    /// `[plugins] auto_probe = false`：裸 dll 没被收编（用户配置优先，不偷偷动文件）。
+    pub probe_disabled: bool,
+}
+
+impl DiscoverReport {
+    /// 一句话摘要（toast / 卡片里的「上次扫描」都用它）。
+    pub fn describe(&self) -> String {
+        let mut parts = vec![format!("扫到 {} 组 / {} 条", self.groups, self.entries)];
+        if self.probe_disabled {
+            parts.push("裸 dll 未收编（[plugins] auto_probe = false）".to_string());
+        } else if !self.adopt.is_empty() {
+            parts.push(self.adopt.describe());
+        }
+        if !self.new_groups.is_empty() {
+            parts.push(format!(
+                "新组 {}：{}",
+                self.new_groups.len(),
+                self.new_groups.join("、")
+            ));
+        }
+        if self.new_entries > 0 {
+            parts.push(format!("新条目 {} 个（待安装）", self.new_entries));
+        }
+        if self.merge.broken > 0 {
+            parts.push(format!("缺文件 {} 个", self.merge.broken));
+        }
+        if self.merge.recovered > 0 {
+            parts.push(format!("恢复 {} 个", self.merge.recovered));
+        }
+        if !self.problems.is_empty() {
+            parts.push(format!("{} 个清单问题", self.problems.len()));
+        }
+        if !self.skipped.is_empty() {
+            parts.push(format!(
+                "{} 个目录被跳过（缺 PnC.toml）：{}",
+                self.skipped.len(),
+                self.skipped.join("、")
+            ));
+        }
+        if parts.len() == 1 && self.new_groups.is_empty() && self.new_entries == 0 {
+            parts.push("账本无变化".to_string());
+        }
+        parts.join(" · ")
+    }
+
+    /// 给用户看的详细版：摘要 + 每个问题一行（toast 只放摘要，详情进日志/卡片）。
+    pub fn detail(&self) -> String {
+        let mut s = self.describe();
+        for p in &self.problems {
+            s.push_str("\n· ");
+            s.push_str(p);
+        }
+        for p in &self.adopt.problems {
+            s.push_str("\n· ");
+            s.push_str(p);
+        }
+        s
+    }
+}
+
+/// **主动扫描发现**：自举 → 扫描 → 对账，三步一条链（GUI 一个按钮，不用 CLI/重启）。
+///
+/// 顺序不可换：
+/// 1. `bootstrap` 先跑 —— 扫描只认目录，裸 dll 躺在根目录下永远成不了候选；
+///    同时补做上次因 dll 被占用而挂起的换组搬迁，避免"账上说在 B、文件还在 A"。
+/// 2. `scan_plugins` 只读扫盘，产出快照。
+/// 3. `reconcile` 把已装条目的健康位刷新（缺文件/恢复），候选**不落库**。
+///
+/// 调用方负责 `save()` 与重新装配：本函数不写注册表文件，也不加载任何 dll。
+pub fn discover(root: &Path, auto_probe: bool, reg: &mut ToolRegistry) -> DiscoverReport {
+    let mut rep = DiscoverReport::default();
+    if root.is_dir() {
+        rep.probe_disabled = !auto_probe;
+        rep.adopt = plugin_host::bootstrap(root, auto_probe);
+        rep.skipped = skipped_dirs(root);
+    }
+    let (snap, problems) = scan_plugins(root);
+    rep.problems = problems;
+    rep.groups = snap.groups.len();
+    rep.entries = snap.groups.iter().map(|g| g.entries.len()).sum();
+    rep.new_groups = snap
+        .groups
+        .iter()
+        .filter(|g| reg.group(&g.id).is_none())
+        .map(|g| g.id.clone())
+        .collect();
+    rep.new_entries = snap
+        .groups
+        .iter()
+        .flat_map(|g| g.entries.iter())
+        .filter(|e| reg.entry(&e.id).is_none())
+        .count();
+    rep.merge = reg.reconcile(&snap);
+    rep
+}
+
+/// 扫描器会跳过的目录名（`.`／`_` 开头是用户素材约定，`target` 是构建产物）。
+fn scan_visible_dir(name: &str) -> bool {
+    !name.starts_with('.') && !name.starts_with('_') && name != "target"
+}
+
+/// 根目录下**可见但读不出组清单**的目录：这些目录扫描时会静默跳过。
+///
+/// 最常见的踩坑：用户在 `plugins/` 里新建一个文件夹、把 dll 丢进去，却没写
+/// `PnC.toml`——扫描看不到任何东西，界面显示"0 组"，用户以为功能坏了。
+fn skipped_dirs(root: &Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = rd
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter(|e| scan_visible_dir(&e.file_name().to_string_lossy()))
+        .filter(|e| plugin_host::manifest::load_group(&e.path()).is_err())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
 /// 确保 `plugins/<id>/` 与其中的 `PnC.toml` 存在（转发插件宿主，UI 只需要这一个入口）。
 ///
 /// 新建组时调用：用户只输入组名，目录和清单都是自动的——否则"建了组却往里放不了
@@ -1901,6 +2041,99 @@ mod tests {
             1,
             "不能因为改名多出一个未分配组"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ------------------------------------------------ 主动扫描发现（GUI 按钮）
+
+    /// 造一个真实磁盘插件组：`<root>/<组>/PnC.toml` + 两个成员（一个带 dll、一个只有清单）。
+    fn write_plugin_group(root: &Path) {
+        let g = root.join("demo");
+        std::fs::create_dir_all(g.join("ok")).unwrap();
+        std::fs::create_dir_all(g.join("miss")).unwrap();
+        std::fs::write(
+            g.join("PnC.toml"),
+            "[group]\nid = \"demo\"\nname = \"演示组\"\nversion = \"0.1.0\"\nkind = \"tools\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            g.join("ok").join("PnC.toml"),
+            "[plugin]\nid = \"demo.ok\"\nname = \"有文件\"\nrisk = \"low\"\nbinary = \"ok.dll\"\n",
+        )
+        .unwrap();
+        // 空文件就够：扫描只查文件在不在，不解析 dll
+        std::fs::write(g.join("ok").join("ok.dll"), b"").unwrap();
+        std::fs::write(
+            g.join("miss").join("PnC.toml"),
+            "[plugin]\nid = \"demo.miss\"\nname = \"缺文件\"\nrisk = \"low\"\nbinary = \"miss.dll\"\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn discover_reports_new_group_without_installing_it() {
+        let d = tmpdir("disc");
+        let root = d.join("plugins");
+        std::fs::create_dir_all(&root).unwrap();
+        write_plugin_group(&root);
+        // 新建文件夹却没写 PnC.toml：扫描静默跳过，必须点名，否则用户以为"点了没反应"
+        std::fs::create_dir_all(root.join("no_manifest")).unwrap();
+
+        let mut reg = ToolRegistry::from_catalog();
+        let rep = discover(&root, true, &mut reg);
+
+        assert!(rep.new_groups.contains(&"demo".to_string()), "{:?}", rep.new_groups);
+        assert_eq!(rep.new_entries, 2, "两个成员都是候选");
+        assert_eq!(rep.skipped, vec!["no_manifest".to_string()], "{:?}", rep.skipped);
+        // 双闸门：发现 ≠ 安装，候选不落库
+        assert!(reg.entry("demo.ok").is_none(), "扫描不能替用户决定安装");
+        assert!(reg.group("demo").is_none(), "新组也不该自动进账本");
+        assert!(rep.describe().contains("demo"), "{}", rep.describe());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn discover_is_idempotent_and_marks_missing_files() {
+        let d = tmpdir("disc2");
+        let root = d.join("plugins");
+        std::fs::create_dir_all(&root).unwrap();
+        write_plugin_group(&root);
+
+        let mut reg = ToolRegistry::from_catalog();
+        let first = discover(&root, true, &mut reg);
+        assert_eq!(first.new_entries, 2);
+
+        // 用户把能装的候选装进 demo 组后，删掉 dll 再重扫
+        let (snap, _) = scan_plugins(&root);
+        let installed = install_all(&mut reg, &snap);
+        assert_eq!(installed, 1, "缺 dll 的候选装不了，只有齐备的那个能装");
+        std::fs::remove_file(root.join("demo/ok/ok.dll")).unwrap();
+
+        let second = discover(&root, true, &mut reg);
+        assert!(second.new_groups.is_empty(), "{:?}", second.new_groups);
+        assert_eq!(second.new_entries, 1, "装不了的候选还在，仍算未安装");
+        assert_eq!(second.merge.broken, 1, "已装条目丢文件要对账成 broken");
+        assert!(second.describe().contains("缺文件 1"), "{}", second.describe());
+        // 幂等：第二次不该再报"新组"（账本已认识它）
+        assert!(!second.describe().contains("新组"), "{}", second.describe());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn discover_respects_auto_probe_off() {
+        let d = tmpdir("disc3");
+        let root = d.join("plugins");
+        std::fs::create_dir_all(&root).unwrap();
+        // 裸 dll 丢在根目录：auto_probe 关掉时必须原地不动，只提示
+        let loose = root.join("loose.dll");
+        std::fs::write(&loose, b"not a real dll").unwrap();
+
+        let mut reg = ToolRegistry::from_catalog();
+        let rep = discover(&root, false, &mut reg);
+        assert!(rep.probe_disabled);
+        assert!(rep.adopt.adopted.is_empty(), "{:?}", rep.adopt.adopted);
+        assert!(loose.is_file(), "用户明确不让程序动插件目录，就不能搬");
+        assert!(rep.describe().contains("auto_probe"), "{}", rep.describe());
         let _ = std::fs::remove_dir_all(&d);
     }
 }
