@@ -287,7 +287,9 @@ pub fn parse(html: &str, base_url: &str) -> Doc {
         if t.name == "title" && !t.closing {
             if let Some(close) = tags[idx..].iter().position(|x| x.name == "title" && x.closing) {
                 let ct = &tags[idx + close];
-                doc.title = textx::strip_tags(&html[t.end..ct.start]);
+                // 与下方 <a> 分支对齐：畸形 HTML 里可能后一个标签的 start 早于
+                // 前一个的 end，直接切片会 panic。
+                doc.title = textx::strip_tags(&html[t.end.min(ct.start)..ct.start]);
             }
         }
         if t.name == "meta" {
@@ -457,6 +459,35 @@ mod tests {
         assert!(d.emails.contains(&"admin@example.com".to_string()));
         assert!(d.handlers.iter().any(|h| h.contains("onclick")));
         assert!(d.handlers.iter().any(|h| h.contains("javascript:")));
+    }
+
+    /// 中文页面：title / 正文 / 链接文字都不能乱码，也不能在内联脚本处断掉。
+    #[test]
+    fn parses_chinese_page() {
+        let page = r#"<html><head><title>中文标题：测试</title></head>
+<body><h1>产品介绍</h1>
+<p>这是一段中文正文，含全角标点：（）【】</p>
+<script>var 名字 = "中文";</script>
+<a href="/详情?id=1">查看详情</a>
+</body></html>"#;
+        let d = parse(page, "http://cn.local/");
+        assert_eq!(d.title, "中文标题：测试");
+        assert!(d.text.contains("产品介绍"), "正文乱码：{}", d.text);
+        assert!(
+            d.text.contains("全角标点：（）【】"),
+            "多字节字符被破坏：{}",
+            d.text
+        );
+        assert!(
+            !d.text.contains("var 名字"),
+            "内联脚本不应进入正文：{}",
+            d.text
+        );
+        assert!(
+            d.links.iter().any(|l| l.text == "查看详情"),
+            "链接文字乱码：{:?}",
+            d.links.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
     }
 
     #[test]

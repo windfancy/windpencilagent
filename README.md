@@ -183,7 +183,7 @@ windpencilagent-cli [--config <path>] [--yes] [<command>]
   (无子命令) / chat              交互对话
   run --objective <s>            单次任务（退出码 = 成功与否）
   tools                          列出当前工具面（按组）
-  call <tool> [json]             直接调工具，不经过 LLM（冒烟 / 调试）
+  call <tool> [json]             直接调工具，不经过 LLM（冒烟 / 调试；授权范围取 [scope] authorized）
   domain list | show | set-groups 领域列表 / 详情 / 改写组引用
   registry list | install | uninstall | enable | disable | move
   registry export [--check]      生成或校验领域的工具清单

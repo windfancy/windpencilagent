@@ -716,14 +716,19 @@ fn dir_name_for(id: &str) -> String {
 }
 
 /// 直接调用工具并打印结果（`wpa-cli call`）。
-async fn call_tool(base: &Base, name: &str, raw: &str) -> anyhow::Result<()> {
+async fn call_tool(base: &Base, cfg: &AppConfig, name: &str, raw: &str) -> anyhow::Result<()> {
     let args: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("参数不是合法 JSON：{e}"))?;
     let Some(tool) = base.kern.tool(name) else {
         anyhow::bail!("未注册的工具：{name}（用 `tools` 查看全部，`registry list` 看注册表）");
     };
     let ctx = kern_core::model::ExecutionContext {
-        scope: Vec::new(),
+        // 授权范围必须来自配置：这里写死 `Vec::new()` 会让所有依赖 ctx.scope
+        // 做二次校验的工具（出网插件、白名单型工具）永远判定「未声明授权」，
+        // `[scope] authorized` 配了也不生效。取值走 merged_scope（无 --target，
+        // 即配置文件），与 build_session 在无 CLI 目标时的分支一致。
+        // 空仍表示未声明（fail-closed）。
+        scope: cfg.merged_scope(&[]),
         session_id: kern_core::model::SessionId::new(),
         agent_id: kern_core::model::AgentId::new("cli-call"),
         task_id: kern_core::model::TaskId::new("cli-call"),
@@ -737,6 +742,12 @@ async fn call_tool(base: &Base, name: &str, raw: &str) -> anyhow::Result<()> {
     if let Some(d) = &out.detail {
         let txt = serde_json::to_string_pretty(d).unwrap_or_else(|_| d.to_string());
         println!("--- detail ---\n{txt}");
+    }
+    // 授权范围显式回显：插件拿不到目标时，先看这一行就知道是配置没写还是被拒。
+    if ctx.scope.is_empty() {
+        println!("授权范围：（空）—— [scope] authorized 未声明，依赖它的工具会按 fail-closed 处理");
+    } else {
+        println!("授权范围（{} 项）：{}", ctx.scope.len(), ctx.scope.join(", "));
     }
     if !out.ok {
         std::process::exit(2);
@@ -1085,7 +1096,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::Call { tool, args }) => {
             let base = assemble(&cfg, None).await?;
-            let code = call_tool(&base, &tool, &args).await;
+            let code = call_tool(&base, &cfg, &tool, &args).await;
             base.shutdown().await;
             code
         }

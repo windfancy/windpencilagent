@@ -165,34 +165,42 @@ pub fn decode_entities(s: &str) -> String {
 }
 
 /// 取 HTML 的可见文本（去标签、跳过 script/style、折叠空白）。
+///
+/// 全程按**字节**扫描，不做 `&str[i..]` 切片：中文页面里 `i` 会落在多字节
+/// UTF-8 序列的中间，字符串切片会直接 panic；`bytes[i] as char` 则把每个
+/// 字节当成一个 Latin-1 字符，中文变乱码。这里把可见字节累积进 `Vec<u8>`，
+/// 最后一次性按 UTF-8 解码——与原 `url_decode` 同一套做法。
 pub fn strip_tags(html: &str) -> String {
-    let mut out = String::with_capacity(html.len() / 2);
+    let bytes = html.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len() / 2);
     let mut in_tag = false;
     let mut in_script = false;
-    let lower = html.to_ascii_lowercase();
-    let bytes = html.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if !in_tag && lower[i..].starts_with("<script") {
+        // 开闭标签也只做字节级比较，避免在字符中间切串。
+        if !in_tag && !in_script && starts_with_ascii_ci(&bytes[i..], b"<script") {
             in_script = true;
         }
-        if !in_tag && lower[i..].starts_with("</script") {
+        if !in_tag && in_script && starts_with_ascii_ci(&bytes[i..], b"</script") {
             in_script = false;
         }
-        let c = bytes[i] as char;
-        if c == '<' {
-            in_tag = true;
-        } else if c == '>' {
-            in_tag = false;
-            out.push(' ');
-        } else if !in_tag && !in_script {
-            out.push(c);
+        match bytes[i] {
+            b'<' => in_tag = true,
+            b'>' => {
+                in_tag = false;
+                out.push(b' ');
+            }
+            b if !in_tag && !in_script => out.push(b),
+            _ => {}
         }
         i += 1;
     }
-    let mut collapsed = String::with_capacity(out.len());
+    // 被剔除的区间都以 ASCII 字节（`<` / `>`）为界，因此 out 仍是合法 UTF-8；
+    // lossy 只是对畸形输入的兜底，不会把正常中文变成替换字符。
+    let text = String::from_utf8_lossy(&out);
+    let mut collapsed = String::with_capacity(text.len());
     let mut last_space = false;
-    for ch in decode_entities(&out).chars() {
+    for ch in decode_entities(&text).chars() {
         if ch.is_whitespace() {
             if !last_space {
                 collapsed.push(' ');
@@ -204,6 +212,11 @@ pub fn strip_tags(html: &str) -> String {
         }
     }
     collapsed.trim().to_string()
+}
+
+/// 字节级的前缀比较（忽略 ASCII 大小写），用于识别 `<script` / `</script`。
+fn starts_with_ascii_ci(hay: &[u8], needle: &[u8]) -> bool {
+    hay.len() >= needle.len() && hay[..needle.len()].eq_ignore_ascii_case(needle)
 }
 
 // ------------------------------------------------------- 手写扫描（替代正则）
@@ -482,6 +495,25 @@ mod tests {
             strip_tags("<p>hi <b>there</b></p><script>bad()</script>"),
             "hi there"
         );
+    }
+
+    /// 中文页面的回归测试。
+    ///
+    /// 旧实现有两个致命问题：`bytes[i] as char` 把 UTF-8 的每个字节当成一个
+    /// Latin-1 字符（中文变乱码），`lower[i..]` 在多字节字符中间切片（直接 panic）。
+    /// html::parse 依赖本函数，所以中文页同样不可用。
+    #[test]
+    fn strip_tags_handles_multibyte_utf8() {
+        assert_eq!(strip_tags("<p>中文<b>加粗</b>正文</p>"), "中文 加粗 正文");
+        assert_eq!(strip_tags("前<i>中</i>后"), "前 中 后");
+        assert_eq!(strip_tags("汉字"), "汉字", "无标签时应原样输出字节");
+        assert_eq!(
+            strip_tags("<div>标题：测试</div><script>var 中文 = 1;</script><p>结果 🚀</p>"),
+            "标题：测试 结果 🚀",
+            "script 内容按字节跳过，标签外的中文不受影响"
+        );
+        assert_eq!(strip_tags("<script>中文</script>尾巴"), "尾巴");
+        assert_eq!(strip_tags("<b>🚀</b>"), "🚀", "4 字节字符紧贴标签");
     }
 
     #[test]
